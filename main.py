@@ -117,7 +117,6 @@ async def track(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
 # -------- Commands --------
 async def start_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    log.info("Handling /start for %s", update.effective_user.id)
     await update.message.reply_text("Bot hidup. Coba /stats atau /broadcast (admin).")
 async def ping_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
@@ -151,18 +150,6 @@ async def admin_del_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     ok=await del_admin(pool, target); await update.message.reply_text(("Admin dihapus" if ok else "User bukan admin / gagal menghapus")+f": {target}")
 
 # -------- Broadcast flow --------
-@dataclass
-class BroadcastDraft:
-    text:str=""; photo_file_id:Optional[str]=None; video_file_id:Optional[str]=None; animation_file_id:Optional[str]=None
-    buttons:List[ButtonDef]=field(default_factory=list)
-@dataclass
-class Session:
-    step:str=Step.IDLE; draft:BroadcastDraft=field(default_factory=BroadcastDraft); temp_button_text:Optional[str]=None
-sessions: Dict[int, Session] = {}
-def ensure_session(uid:int)->Session:
-    if uid not in sessions: sessions[uid]=Session()
-    return sessions[uid]
-
 async def broadcast_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     pool=context.application.bot_data["pool"]
     if not await is_admin(pool, update.effective_user.id):
@@ -198,7 +185,7 @@ async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if s.step==Step.ASK_BUTTON_URL:
         if not msg.text or not msg.text.strip().lower().startswith(("http://","https://")):
             return await msg.reply_text("URL tidak valid. Contoh: https://example.com")
-        s.draft.buttons.append(InlineKeyboardButton(s.temp_button_text, url=msg.text.strip()))
+        s.draft.buttons.append(ButtonDef(text=s.temp_button_text, url=msg.text.strip()))
         s.temp_button_text=None; s.step=Step.ASK_ADD_BUTTON
         return await msg.reply_text("Tambah button lagi?", reply_markup=yesno_keyboard())
 
@@ -221,14 +208,7 @@ async def cb_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
             s.step=Step.IDLE; s.draft=BroadcastDraft(); return await query.edit_message_text("Broadcast dibatalkan.")
 
 async def show_preview(query, draft:BroadcastDraft):
-    # convert InlineKeyboardButton list back into layout (1 per row)
-    if draft.buttons and isinstance(draft.buttons[0], InlineKeyboardButton):
-        rows=[[b] for b in draft.buttons]
-        kb=InlineKeyboardMarkup(rows)
-    else:
-        rows=[[InlineKeyboardButton(b.text, url=b.url)] for b in draft.buttons]
-        kb=InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
-    caption=draft.text or ""; chat_id=query.message.chat_id
+    kb=draft_keyboard(draft); caption=draft.text or ""; chat_id=query.message.chat_id
     if draft.photo_file_id:
         await query.message.bot.send_photo(chat_id, draft.photo_file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
     elif draft.video_file_id:
@@ -243,11 +223,7 @@ async def show_preview(query, draft:BroadcastDraft):
                                            [InlineKeyboardButton("❌ Batal", callback_data="preview_cancel")]]))
 
 async def do_broadcast(context:ContextTypes.DEFAULT_TYPE, draft:BroadcastDraft, query):
-    pool=context.application.bot_data["pool"]; targets=await get_all_user_ids(pool); sent=0; failed=0
-    if draft.buttons and isinstance(draft.buttons[0], InlineKeyboardButton):
-        kb=InlineKeyboardMarkup([[b] for b in draft.buttons])
-    else:
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton(b.text, url=b.url)] for b in draft.buttons]) if draft.buttons else InlineKeyboardMarkup([])
+    pool=context.application.bot_data["pool"]; targets=await get_all_user_ids(pool); sent=0; failed=0; kb=draft_keyboard(draft)
     for chat_id in targets:
         try:
             if draft.photo_file_id:
@@ -285,9 +261,9 @@ def build_app():
         .post_shutdown(post_shutdown)
         .build())
 
-    # Use block in handler constructors (PTB v21) and order by group
-    app.add_handler(TypeHandler(Update, debug_all, block=False), group=-2)
-    app.add_handler(TypeHandler(Update, track, block=False), group=-1)
+    # Perbaikan: Hapus semua parameter 'block'
+    app.add_handler(TypeHandler(Update, debug_all), group=-2)
+    app.add_handler(TypeHandler(Update, track), group=-1)
 
     app.add_handler(CommandHandler("start", start_cmd), group=0)
     app.add_handler(CommandHandler("ping", ping_cmd), group=0)
