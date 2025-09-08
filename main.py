@@ -1,3 +1,30 @@
+"""
+Telegram Broadcast Bot — Railway + Postgres (python-telegram-bot v21)
+---------------------------------------------------------------
+Fitur:
+- /broadcast (flow: teks → media opsional → tombol opsional → preview → kirim)
+- Simpan user yang berinteraksi (users table) & hitung jumlah pengguna (/stats)
+- Manajemen admin: /admins (lihat), /admin_add, /admin_del (khusus OWNER)
+- Broadcast ke semua user terdaftar (atau ganti query sesuai kebutuhan)
+- Siap deploy di Railway + Database PostgreSQL
+
+ENV yang dibutuhkan:
+- BOT_TOKEN       : token Bot Telegram
+- OWNER_ID        : ID pemilik (angka) — hanya ini yang bisa tambah/hapus admin
+- DATABASE_URL    : URL Postgres, contoh: postgres://user:pass@host:5432/dbname
+
+Requirements (requirements.txt):
+--------------------------------
+python-telegram-bot==21.6
+asyncpg==0.29.0
+python-dotenv==1.0.1
+
+Procfile (opsional, Railway autodetect Python):
+-----------------------------------------------
+web: python main.py
+
+"""
+
 import os
 import asyncio
 from dataclasses import dataclass, field
@@ -471,16 +498,30 @@ async def main_async():
 
     app = await build_app(pool)
 
-    # Jalankan polling & health server bersamaan
-    async def run_polling():
-        # run_polling sudah handle initialize/start/idle/stop secara internal
-        await app.run_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True,
-            close_loop=False,  # karena kita masih punya task lain
-        )
+    # --- Manual polling sequence (tanpa run_polling agar tidak bentrok event loop) ---
+    await app.initialize()
+    # Pastikan webhook mati & test koneksi di post_init
+    await app.start()
 
-    await asyncio.gather(run_polling(), serve_healthz())
+    # Mulai polling
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    # Health server jalan paralel
+    health_task = asyncio.create_task(serve_healthz())
+
+    # Tunggu sampai updater berhenti (SIGTERM dari Railway akan menghentikan proses)
+    try:
+        await app.updater.wait_until_closed()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        health_task.cancel()
+        try:
+            await health_task
+        except asyncio.CancelledError:
+            pass
+        await pool.close()
 
 if __name__ == "__main__":
     try:
