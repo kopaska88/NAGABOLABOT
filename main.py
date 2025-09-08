@@ -1,37 +1,34 @@
 """
 Telegram Broadcast Bot — Railway + Postgres (python-telegram-bot v21)
----------------------------------------------------------------
+---------------------------------------------------------------------
 Fitur:
 - /broadcast (flow: teks → media opsional → tombol opsional → preview → kirim)
 - Simpan user yang berinteraksi (users table) & hitung jumlah pengguna (/stats)
 - Manajemen admin: /admins (lihat), /admin_add, /admin_del (khusus OWNER)
-- Broadcast ke semua user terdaftar (atau ganti query sesuai kebutuhan)
-- Siap deploy di Railway + Database PostgreSQL
+- Broadcast ke semua user terdaftar (default), siap untuk Railway + PostgreSQL
 
 ENV yang dibutuhkan:
 - BOT_TOKEN       : token Bot Telegram
 - OWNER_ID        : ID pemilik (angka) — hanya ini yang bisa tambah/hapus admin
-- DATABASE_URL    : URL Postgres, contoh: postgres://user:pass@host:5432/dbname
+- DATABASE_URL    : URL Postgres, contoh: postgresql://user:pass@host:5432/dbname
+- PORT            : (opsional) port untuk health check HTTP server (Railway)
 
-Requirements (requirements.txt):
---------------------------------
-python-telegram-bot==21.6
-asyncpg==0.29.0
-python-dotenv==1.0.1
-
-Procfile (opsional, Railway autodetect Python):
------------------------------------------------
-web: python main.py
-
+Cara jalan (lokal):
+- pip install -r requirements.txt
+- export BOT_TOKEN=xxx OWNER_ID=123 DATABASE_URL="postgresql://..."
+- python main.py
 """
 
 import os
 import asyncio
+import logging
+import threading
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
-from datetime import datetime
 
 import asyncpg
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 from telegram import (
     Update, InlineKeyboardMarkup, InlineKeyboardButton
 )
@@ -40,13 +37,20 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
-from dotenv import load_dotenv
+from telegram.request import HTTPXRequest
+
+# ----------------- LOGGING -----------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
+logger = logging.getLogger("broadcast-bot")
 
 # ----------------- ENV -----------------
-load_dotenv()  # aman jika lokal; di Railway ENV tetap dari panel
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+OWNER_ID = int(os.getenv("OWNER_ID", "0") or "0")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+PORT = int(os.getenv("PORT", "8080"))  # Railway typically sets this
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN kosong. Set ENV BOT_TOKEN.")
@@ -55,21 +59,19 @@ if not DATABASE_URL:
 if not OWNER_ID:
     raise RuntimeError("OWNER_ID kosong. Set ENV OWNER_ID (integer Telegram user_id).")
 
-# -------------- DB UTILS --------------
+# ----------------- DB HELPERS -----------------
 async def init_db(pool: asyncpg.Pool):
     async with pool.acquire() as con:
-        # Tabel users: simpan interaksi
         await con.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                first_name TEXT,
-                username TEXT,
-                last_seen TIMESTAMPTZ NOT NULL
+                user_id     BIGINT PRIMARY KEY,
+                first_name  TEXT,
+                username    TEXT,
+                last_seen   TIMESTAMPTZ NOT NULL
             );
             """
         )
-        # Tabel admins: list admin
         await con.execute(
             """
             CREATE TABLE IF NOT EXISTS admins (
@@ -77,10 +79,10 @@ async def init_db(pool: asyncpg.Pool):
             );
             """
         )
-        # Pastikan OWNER adalah admin minimal (opsional)
+        # ensure owner is admin
         await con.execute(
             "INSERT INTO admins(user_id) VALUES($1) ON CONFLICT (user_id) DO NOTHING;",
-            OWNER_ID,
+            OWNER_ID
         )
 
 async def upsert_user(pool: asyncpg.Pool, uid: int, first_name: Optional[str], username: Optional[str]):
@@ -90,9 +92,9 @@ async def upsert_user(pool: asyncpg.Pool, uid: int, first_name: Optional[str], u
             INSERT INTO users(user_id, first_name, username, last_seen)
             VALUES($1, $2, $3, NOW())
             ON CONFLICT (user_id)
-            DO UPDATE SET first_name=EXCLUDED.first_name,
-                          username=EXCLUDED.username,
-                          last_seen=NOW();
+            DO UPDATE SET first_name = EXCLUDED.first_name,
+                          username   = EXCLUDED.username,
+                          last_seen  = NOW();
             """,
             uid, first_name, username
         )
@@ -109,7 +111,8 @@ async def add_admin(pool: asyncpg.Pool, uid: int) -> bool:
         try:
             await con.execute("INSERT INTO admins(user_id) VALUES($1)", uid)
             return True
-        except Exception:
+        except Exception as e:
+            logger.warning("add_admin failed for %s: %s", uid, e)
             return False
 
 async def del_admin(pool: asyncpg.Pool, uid: int) -> bool:
@@ -135,7 +138,7 @@ async def get_all_user_ids(pool: asyncpg.Pool) -> List[int]:
         rows = await con.fetch("SELECT user_id FROM users")
         return [r[0] for r in rows]
 
-# -------------- BROADCAST STATE --------------
+# ----------------- BROADCAST STATE -----------------
 class Step:
     ASK_TEXT = "ASK_TEXT"
     ASK_MEDIA = "ASK_MEDIA"
@@ -166,7 +169,6 @@ class Session:
 
 sessions: Dict[int, Session] = {}
 
-# -------------- HELPERS --------------
 def ensure_session(user_id: int) -> Session:
     if user_id not in sessions:
         sessions[user_id] = Session()
@@ -185,19 +187,21 @@ def preview_keyboard() -> InlineKeyboardMarkup:
 
 def yesno_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Ya", callback_data="btn_yes"), InlineKeyboardButton("Tidak", callback_data="btn_no")]
+        [InlineKeyboardButton("Ya", callback_data="btn_yes"),
+         InlineKeyboardButton("Tidak", callback_data="btn_no")]
     ])
 
-# -------------- HANDLERS --------------
+# ----------------- HANDLERS -----------------
 async def track_user_interaction(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Call in every handler via application.add_handler(MessageHandler(filters.ALL, track_user_interaction), group=0)
     pool: asyncpg.Pool = context.application.bot_data["pool"]
     u = update.effective_user
     if u:
         await upsert_user(pool, u.id, u.first_name, u.username)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Halo! Bot siap. Gunakan /broadcast (admin) atau /stats untuk melihat total pengguna.")
+    await update.message.reply_text(
+        "Halo! Bot siap. Gunakan /broadcast (admin) atau /stats untuk melihat total pengguna."
+    )
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pool: asyncpg.Pool = context.application.bot_data["pool"]
@@ -218,44 +222,36 @@ async def cmd_admin_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid != OWNER_ID:
         return await update.message.reply_text("Hanya OWNER yang dapat menambah admin.")
-
     target_id: Optional[int] = None
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
         target_id = update.message.reply_to_message.from_user.id
     elif context.args and context.args[0].isdigit():
         target_id = int(context.args[0])
-
     if not target_id:
         return await update.message.reply_text("Gunakan /admin_add <user_id> atau reply pesan user.")
-
     ok = await add_admin(pool, target_id)
-    if ok:
-        await update.message.reply_text(f"Berhasil menambah admin: {target_id}")
-    else:
-        await update.message.reply_text("Gagal/duplikat. User mungkin sudah admin.")
+    await update.message.reply_text(
+        f"{'Berhasil' if ok else 'Gagal/duplikat'} menambah admin: {target_id}"
+    )
 
 async def cmd_admin_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pool: asyncpg.Pool = context.application.bot_data["pool"]
     uid = update.effective_user.id
     if uid != OWNER_ID:
         return await update.message.reply_text("Hanya OWNER yang dapat menghapus admin.")
-
     target_id: Optional[int] = None
     if update.message.reply_to_message and update.message.reply_to_message.from_user:
         target_id = update.message.reply_to_message.from_user.id
     elif context.args and context.args[0].isdigit():
         target_id = int(context.args[0])
-
     if not target_id:
         return await update.message.reply_text("Gunakan /admin_del <user_id> atau reply pesan user.")
     if target_id == OWNER_ID:
         return await update.message.reply_text("Tidak dapat menghapus OWNER.")
-
     ok = await del_admin(pool, target_id)
-    if ok:
-        await update.message.reply_text(f"Admin {target_id} dihapus.")
-    else:
-        await update.message.reply_text("User bukan admin atau gagal menghapus.")
+    await update.message.reply_text(
+        f"{'Admin dihapus' if ok else 'User bukan admin / gagal menghapus'}: {target_id}"
+    )
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pool: asyncpg.Pool = context.application.bot_data["pool"]
@@ -270,8 +266,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pool: asyncpg.Pool = context.application.bot_data["pool"]
     uid = update.effective_user.id
     if not await is_admin(pool, uid):
-        return  # abaikan non-admin dalam flow broadcast
-
+        return  # ignore non-admins for broadcast flow
     s = ensure_session(uid)
     msg = update.effective_message
 
@@ -280,7 +275,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return await msg.reply_text("Silakan kirim teks isi broadcast.")
         s.draft.text = msg.text_html
         s.step = Step.ASK_MEDIA
-        return await msg.reply_text("Kirimkan *foto/GIF/video* (opsional) atau ketik *skip*.", parse_mode=ParseMode.MARKDOWN)
+        return await msg.reply_text(
+            "Kirimkan *foto/GIF/video* (opsional) atau ketik *skip*.",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
     if s.step == Step.ASK_MEDIA:
         if msg.text and msg.text.strip().lower() == "skip":
@@ -355,7 +353,7 @@ async def show_preview(query, draft: BroadcastDraft):
     caption_html = draft.text or ""
     kb = draft_keyboard(draft)
     chat_id = query.message.chat_id
-    # kirim preview sesuai jenis
+
     if draft.photo_file_id:
         await query.message.bot.send_photo(chat_id=chat_id, photo=draft.photo_file_id,
                                            caption=caption_html, parse_mode=ParseMode.HTML,
@@ -407,65 +405,59 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, draft: BroadcastDraft
                 await context.bot.send_message(chat_id=chat_id, text=draft.text,
                                                parse_mode=ParseMode.HTML, reply_markup=kb)
             sent += 1
-            await asyncio.sleep(0.05)  # rate limit friendly
-        except Exception:
+            await asyncio.sleep(0.05)
+        except Exception as e:
             failed += 1
+            logger.warning("Broadcast to %s failed: %s", chat_id, e)
             await asyncio.sleep(0.3)
 
     await query.message.reply_text(f"Selesai. Terkirim: {sent}, Gagal: {failed}")
 
-# -------------- MAIN -----------------
-import logging
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from telegram.request import HTTPXRequest
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
-)
-logger = logging.getLogger("broadcast-bot")
-
-PORT = int(os.getenv("PORT", "8000"))  # Railway sometimes sends PORT
-
+# ----------------- APP BUILD / LIFECYCLE -----------------
+# Health check HTTP server (threaded, tidak ganggu event loop PTB)
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/healthz":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
+            self.send_response(200); self.end_headers(); self.wfile.write(b"ok")
         else:
-            self.send_response(404)
-            self.end_headers()
+            self.send_response(404); self.end_headers()
 
-async def post_init_del_webhook(app):
-    # Pastikan tidak ada webhook yang aktif (kalau sebelumnya pernah pakai webhook)
-    try:
-        await app.bot.delete_webhook(drop_pending_updates=True)
-        me = await app.bot.get_me()
-        logger.info("Bot authorized as @%s (%s)", me.username, me.id)
-    except Exception as e:
-        logger.exception("POST_INIT error: %s", e)
+def start_health_server():
+    srv = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info("Health server on :%s", PORT)
+    srv.serve_forever()
 
-async def build_app(pool: asyncpg.Pool):
-    # Atur request client dengan timeout yang lebih longgar (Railway kadang lambat warm-up)
+async def on_post_init(app):
+    # DB pool
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    await init_db(pool)
+    app.bot_data["pool"] = pool
+    # pastikan webhook mati & test token
+    await app.bot.delete_webhook(drop_pending_updates=True)
+    me = await app.bot.get_me()
+    logger.info("Bot authorized as @%s (%s)", me.username, me.id)
+
+async def on_post_shutdown(app):
+    pool: asyncpg.Pool = app.bot_data.get("pool")
+    if pool:
+        await pool.close()
+        logger.info("DB pool closed.")
+
+def build_app():
     request = HTTPXRequest(
         connect_timeout=15.0,
         read_timeout=45.0,
         write_timeout=15.0,
         pool_timeout=15.0,
     )
+    app = (ApplicationBuilder()
+           .token(BOT_TOKEN)
+           .request(request)
+           .post_init(on_post_init)
+           .post_shutdown(on_post_shutdown)
+           .build())
 
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .request(request)
-        .post_init(post_init_del_webhook)
-        .build()
-    )
-
-    app.bot_data["pool"] = pool
-
-    # Group 0: tracker interaksi (jalan duluan untuk semua update)
+    # Handlers: tracker duluan
     app.add_handler(MessageHandler(filters.ALL, track_user_interaction), group=0)
 
     # Commands umum
@@ -477,54 +469,23 @@ async def build_app(pool: asyncpg.Pool):
     app.add_handler(CommandHandler("admin_add", cmd_admin_add))
     app.add_handler(CommandHandler("admin_del", cmd_admin_del))
 
-    # Broadcast
+    # Broadcast flow
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.ALL, handle_message))
 
     return app
 
-async def serve_healthz():
-    # Jalankan HTTP server sederhana agar Railway menganggap service "up"
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    logger.info("Health server on :%s", PORT)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, server.serve_forever)
+def main():
+    # Health server (thread)
+    threading.Thread(target=start_health_server, daemon=True).start()
 
-async def main_async():
-    # Pool Postgres
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    await init_db(pool)
-
-    app = await build_app(pool)
-
-    # --- Manual polling sequence (tanpa run_polling agar tidak bentrok event loop) ---
-    await app.initialize()
-    # Pastikan webhook mati & test koneksi di post_init
-    await app.start()
-
-    # Mulai polling
-    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
-    # Health server jalan paralel
-    health_task = asyncio.create_task(serve_healthz())
-
-    # Tunggu sampai updater berhenti (SIGTERM dari Railway akan menghentikan proses)
-    try:
-        await app.updater.wait_until_closed()
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        health_task.cancel()
-        try:
-            await health_task
-        except asyncio.CancelledError:
-            pass
-        await pool.close()
+    app = build_app()
+    # Biarkan PTB yang kelola event loop sepenuhnya (stabil, tanpa bentrok)
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main_async())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    main()
