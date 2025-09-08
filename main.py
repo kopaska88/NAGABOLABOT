@@ -102,7 +102,7 @@ async def debug_all(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if update.message:
         log.info("UPDATE message chat=%s text=%r", update.message.chat_id, update.message.text)
     elif update.callback_query:
-        log.info("UPDATE callback from=%s data=%r", update.callback_query.from_user.id, update.callback_query.data)
+        log.info("UPDATE callback from=%s data=%r (step=%s)", update.callback_query.from_user.id, update.callback_query.data, sessions.get(update.callback_query.from_user.id, Session()).step)
     elif update.my_chat_member:
         log.info("UPDATE my_chat_member chat=%s status=%s", update.my_chat_member.chat.id, update.my_chat_member.new_chat_member.status)
     else:
@@ -132,6 +132,25 @@ async def admins_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     ids=await get_admins(pool)
     await update.message.reply_text("Daftar admin:\n" + "\n".join(f"- {i}" + (" (OWNER)" if i==OWNER_ID else "") for i in ids))
 
+# -------- Preview helper --------
+async def send_preview_to_chat(context:ContextTypes.DEFAULT_TYPE, chat_id:int, draft:BroadcastDraft):
+    rows=[[InlineKeyboardButton(b.text, url=b.url)] for b in draft.buttons]
+    kb=InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
+    caption=draft.text or ""
+    if draft.photo_file_id:
+        await context.bot.send_photo(chat_id, draft.photo_file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    elif draft.video_file_id:
+        await context.bot.send_video(chat_id, draft.video_file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    elif draft.animation_file_id:
+        await context.bot.send_animation(chat_id, draft.animation_file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    else:
+        await context.bot.send_message(chat_id, caption, parse_mode=ParseMode.HTML, reply_markup=kb)
+    await context.bot.send_message(
+        chat_id, "Preview di atas. Lanjutkan?",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Kirim", callback_data="preview_send")],
+                                           [InlineKeyboardButton("🔁 Ulangi", callback_data="preview_restart")],
+                                           [InlineKeyboardButton("❌ Batal", callback_data="preview_cancel")]]))
+
 # -------- Broadcast flow --------
 async def broadcast_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     pool=context.application.bot_data["pool"]
@@ -145,18 +164,21 @@ async def broadcast_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
     pool=context.application.bot_data["pool"]; uid=update.effective_user.id
     s=ensure_session(uid)
-    # <<-- penting: kalau bukan admin ATAU sesi idle, abaikan agar tidak 'menelan' command
+    # hanya proses jika admin dan sedang dalam flow (bukan IDLE)
     if (not await is_admin(pool, uid)) or s.step==Step.IDLE:
         return
     msg=update.effective_message
+
     if s.step==Step.ASK_TEXT:
         if not msg.text or msg.text.strip().lower()=="/broadcast":
             return await msg.reply_text("Silakan kirim teks isi broadcast.")
         s.draft.text=msg.text_html; s.step=Step.ASK_MEDIA
         return await msg.reply_text("Kirimkan *foto/GIF/video* (opsional) atau ketik *skip*.", parse_mode=ParseMode.MARKDOWN)
+
     if s.step==Step.ASK_MEDIA:
         if msg.text and msg.text.strip().lower()=="skip":
-            s.step=Step.ASK_ADD_BUTTON; return await msg.reply_text("Tambah *button*?", reply_markup=yesno_keyboard(), parse_mode=ParseMode.MARKDOWN)
+            s.step=Step.ASK_ADD_BUTTON
+            return await msg.reply_text("Tambah *button*?", reply_markup=yesno_keyboard(), parse_mode=ParseMode.MARKDOWN)
         if msg.photo:
             s.draft.photo_file_id=msg.photo[-1].file_id; s.draft.video_file_id=None; s.draft.animation_file_id=None
         elif msg.video:
@@ -165,11 +187,25 @@ async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
             s.draft.animation_file_id=msg.animation.file_id; s.draft.photo_file_id=None; s.draft.video_file_id=None
         else:
             return await msg.reply_text("Format tidak dikenali. Kirim foto/GIF/video atau *skip*.", parse_mode=ParseMode.MARKDOWN)
-        s.step=Step.ASK_ADD_BUTTON; return await msg.reply_text("Tambah *button*?", reply_markup=yesno_keyboard(), parse_mode=ParseMode.MARKDOWN)
+        s.step=Step.ASK_ADD_BUTTON
+        return await msg.reply_text("Tambah *button*?", reply_markup=yesno_keyboard(), parse_mode=ParseMode.MARKDOWN)
+
+    if s.step==Step.ASK_ADD_BUTTON:
+        if msg.text:
+            txt=msg.text.strip().lower()
+            if txt in ("ya","yes","y"):
+                s.step=Step.ASK_BUTTON_TEXT
+                return await msg.reply_text("Kirim *teks button* (contoh: Kunjungi Situs)", parse_mode=ParseMode.MARKDOWN)
+            if txt in ("tidak","no","n"):
+                s.step=Step.PREVIEW
+                return await send_preview_to_chat(context, update.effective_chat.id, s.draft)
+        # jika bukan teks, biarkan; klik inline button akan ditangani di cb_handler
+
     if s.step==Step.ASK_BUTTON_TEXT:
         if not msg.text: return await msg.reply_text("Kirim teks button (misal: Kunjungi Situs).")
         s.temp_button_text=msg.text.strip(); s.step=Step.ASK_BUTTON_URL
         return await msg.reply_text("Kirim URL button (harus diawali http/https).")
+
     if s.step==Step.ASK_BUTTON_URL:
         if not msg.text or not msg.text.strip().lower().startswith(("http://","https://")):
             return await msg.reply_text("URL tidak valid. Contoh: https://example.com")
@@ -180,11 +216,14 @@ async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def cb_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     query=update.callback_query; await query.answer()
     uid=query.from_user.id; s=ensure_session(uid); data=query.data
+    log.info("Callback data=%s step=%s uid=%s", data, s.step, uid)
     if s.step==Step.ASK_ADD_BUTTON:
         if data=="btn_yes":
-            s.step=Step.ASK_BUTTON_TEXT; return await query.edit_message_text("Kirim *teks button* (contoh: Kunjungi Situs)", parse_mode=ParseMode.MARKDOWN)
+            s.step=Step.ASK_BUTTON_TEXT
+            return await query.edit_message_text("Kirim *teks button* (contoh: Kunjungi Situs)", parse_mode=ParseMode.MARKDOWN)
         elif data=="btn_no":
-            s.step=Step.PREVIEW; return await show_preview(query, s.draft)
+            s.step=Step.PREVIEW
+            return await send_preview_to_chat(context, query.message.chat_id, s.draft)
     if s.step==Step.PREVIEW:
         if data=="preview_send":
             await query.edit_message_text("Mulai broadcast…")
@@ -194,23 +233,6 @@ async def cb_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
             s.step=Step.ASK_TEXT; s.draft=BroadcastDraft(); return await query.edit_message_text("Ulangi. Kirim *teks* untuk broadcast.", parse_mode=ParseMode.MARKDOWN)
         elif data=="preview_cancel":
             s.step=Step.IDLE; s.draft=BroadcastDraft(); return await query.edit_message_text("Broadcast dibatalkan.")
-
-async def show_preview(query, draft:BroadcastDraft):
-    rows=[[InlineKeyboardButton(b.text, url=b.url)] for b in draft.buttons]
-    kb=InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
-    caption=draft.text or ""; chat_id=query.message.chat_id
-    if draft.photo_file_id:
-        await query.message.bot.send_photo(chat_id, draft.photo_file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
-    elif draft.video_file_id:
-        await query.message.bot.send_video(chat_id, draft.video_file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
-    elif draft.animation_file_id:
-        await query.message.bot.send_animation(chat_id, draft.animation_file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
-    else:
-        await query.message.bot.send_message(chat_id, caption, parse_mode=ParseMode.HTML, reply_markup=kb)
-    await query.message.bot.send_message(chat_id, "Preview di atas. Lanjutkan?",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Kirim", callback_data="preview_send")],
-                                           [InlineKeyboardButton("🔁 Ulangi", callback_data="preview_restart")],
-                                           [InlineKeyboardButton("❌ Batal", callback_data="preview_cancel")]]))
 
 async def do_broadcast(context:ContextTypes.DEFAULT_TYPE, draft:BroadcastDraft, query):
     pool=context.application.bot_data["pool"]; targets=await get_all_user_ids(pool); sent=0; failed=0
@@ -252,7 +274,6 @@ def build_app():
         .post_shutdown(post_shutdown)
         .build())
 
-    # Order: debug (-2), track (-1), commands (0), callbacks (0), broadcast messages (1)
     app.add_handler(TypeHandler(Update, debug_all, block=False), group=-2)
     app.add_handler(TypeHandler(Update, track, block=False), group=-1)
 
@@ -262,9 +283,7 @@ def build_app():
     app.add_handler(CommandHandler("stats", stats_cmd), group=0)
     app.add_handler(CommandHandler("admins", admins_cmd), group=0)
 
-    # /broadcast via CommandHandler
     app.add_handler(CommandHandler("broadcast", broadcast_cmd), group=0)
-    # Fallback regex: handle /broadcast@bot or case variations
     app.add_handler(MessageHandler(filters.Regex(r'(?i)^/broadcast(@[A-Za-z0-9_]+)?(\s|$)'), broadcast_cmd), group=0)
 
     app.add_handler(CallbackQueryHandler(cb_handler), group=0)
