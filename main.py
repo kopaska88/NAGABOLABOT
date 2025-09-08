@@ -261,10 +261,11 @@ def build_app():
         .post_shutdown(post_shutdown)
         .build())
 
-    # Perbaikan: Hapus semua parameter 'block'
+    # Grouping & block rules to ensure commands run:
     app.add_handler(TypeHandler(Update, debug_all), group=-2)
     app.add_handler(TypeHandler(Update, track), group=-1)
 
+    # Perbaikan: Menambahkan handler untuk command /broadcast
     app.add_handler(CommandHandler("start", start_cmd), group=0)
     app.add_handler(CommandHandler("ping", ping_cmd), group=0)
     app.add_handler(CommandHandler("id", id_cmd), group=0)
@@ -272,6 +273,7 @@ def build_app():
     app.add_handler(CommandHandler("admins", admins_cmd), group=0)
     app.add_handler(CommandHandler("admin_add", admin_add_cmd), group=0)
     app.add_handler(CommandHandler("admin_del", admin_del_cmd), group=0)
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd), group=0)  # <- Handler untuk /broadcast
 
     app.add_handler(CallbackQueryHandler(cb_handler), group=0)
     app.add_handler(MessageHandler(filters.ALL, handle_message), group=1)
