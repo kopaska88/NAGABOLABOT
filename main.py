@@ -131,36 +131,24 @@ async def admins_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await is_admin(pool, uid): return await update.message.reply_text("Khusus admin.")
     ids=await get_admins(pool)
     await update.message.reply_text("Daftar admin:\n" + "\n".join(f"- {i}" + (" (OWNER)" if i==OWNER_ID else "") for i in ids))
-async def admin_add_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    pool=context.application.bot_data["pool"]; uid=update.effective_user.id
-    if uid!=OWNER_ID: return await update.message.reply_text("Hanya OWNER.")
-    target=None
-    if update.message.reply_to_message and update.message.reply_to_message.from_user: target=update.message.reply_to_message.from_user.id
-    elif context.args and context.args[0].isdigit(): target=int(context.args[0])
-    if not target: return await update.message.reply_text("Gunakan /admin_add <user_id> atau reply pesan user.")
-    ok=await add_admin(pool, target); await update.message.reply_text(("Berhasil" if ok else "Gagal/duplikat")+f" menambah admin: {target}")
-async def admin_del_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    pool=context.application.bot_data["pool"]; uid=update.effective_user.id
-    if uid!=OWNER_ID: return await update.message.reply_text("Hanya OWNER.")
-    target=None
-    if update.message.reply_to_message and update.message.reply_to_message.from_user: target=update.message.reply_to_message.from_user.id
-    elif context.args and context.args[0].isdigit(): target=int(context.args[0])
-    if not target: return await update.message.reply_text("Gunakan /admin_del <user_id> atau reply pesan user.")
-    if target==OWNER_ID: return await update.message.reply_text("Tidak dapat menghapus OWNER.")
-    ok=await del_admin(pool, target); await update.message.reply_text(("Admin dihapus" if ok else "User bukan admin / gagal menghapus")+f": {target}")
 
 # -------- Broadcast flow --------
 async def broadcast_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     pool=context.application.bot_data["pool"]
-    if not await is_admin(pool, update.effective_user.id):
+    uid=update.effective_user.id
+    log.info("Handling /broadcast from %s", uid)
+    if not await is_admin(pool, uid):
         return await update.message.reply_text("Maaf, fitur ini hanya untuk admin.")
-    s=ensure_session(update.effective_user.id); s.step=Step.ASK_TEXT; s.draft=BroadcastDraft()
+    s=ensure_session(uid); s.step=Step.ASK_TEXT; s.draft=BroadcastDraft()
     await update.message.reply_text("Kirimkan *teks* untuk broadcast.", parse_mode=ParseMode.MARKDOWN)
 
 async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
     pool=context.application.bot_data["pool"]; uid=update.effective_user.id
-    if not await is_admin(pool, uid): return
-    s=ensure_session(uid); msg=update.effective_message
+    s=ensure_session(uid)
+    # <<-- penting: kalau bukan admin ATAU sesi idle, abaikan agar tidak 'menelan' command
+    if (not await is_admin(pool, uid)) or s.step==Step.IDLE:
+        return
+    msg=update.effective_message
     if s.step==Step.ASK_TEXT:
         if not msg.text or msg.text.strip().lower()=="/broadcast":
             return await msg.reply_text("Silakan kirim teks isi broadcast.")
@@ -208,7 +196,9 @@ async def cb_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
             s.step=Step.IDLE; s.draft=BroadcastDraft(); return await query.edit_message_text("Broadcast dibatalkan.")
 
 async def show_preview(query, draft:BroadcastDraft):
-    kb=draft_keyboard(draft); caption=draft.text or ""; chat_id=query.message.chat_id
+    rows=[[InlineKeyboardButton(b.text, url=b.url)] for b in draft.buttons]
+    kb=InlineKeyboardMarkup(rows) if rows else InlineKeyboardMarkup([])
+    caption=draft.text or ""; chat_id=query.message.chat_id
     if draft.photo_file_id:
         await query.message.bot.send_photo(chat_id, draft.photo_file_id, caption=caption, parse_mode=ParseMode.HTML, reply_markup=kb)
     elif draft.video_file_id:
@@ -223,7 +213,8 @@ async def show_preview(query, draft:BroadcastDraft):
                                            [InlineKeyboardButton("❌ Batal", callback_data="preview_cancel")]]))
 
 async def do_broadcast(context:ContextTypes.DEFAULT_TYPE, draft:BroadcastDraft, query):
-    pool=context.application.bot_data["pool"]; targets=await get_all_user_ids(pool); sent=0; failed=0; kb=draft_keyboard(draft)
+    pool=context.application.bot_data["pool"]; targets=await get_all_user_ids(pool); sent=0; failed=0
+    kb=InlineKeyboardMarkup([[InlineKeyboardButton(b.text, url=b.url)] for b in draft.buttons]) if draft.buttons else InlineKeyboardMarkup([])
     for chat_id in targets:
         try:
             if draft.photo_file_id:
@@ -261,19 +252,20 @@ def build_app():
         .post_shutdown(post_shutdown)
         .build())
 
-    # Grouping & block rules to ensure commands run:
-    app.add_handler(TypeHandler(Update, debug_all), group=-2)
-    app.add_handler(TypeHandler(Update, track), group=-1)
+    # Order: debug (-2), track (-1), commands (0), callbacks (0), broadcast messages (1)
+    app.add_handler(TypeHandler(Update, debug_all, block=False), group=-2)
+    app.add_handler(TypeHandler(Update, track, block=False), group=-1)
 
-    # Perbaikan: Menambahkan handler untuk command /broadcast
     app.add_handler(CommandHandler("start", start_cmd), group=0)
     app.add_handler(CommandHandler("ping", ping_cmd), group=0)
     app.add_handler(CommandHandler("id", id_cmd), group=0)
     app.add_handler(CommandHandler("stats", stats_cmd), group=0)
     app.add_handler(CommandHandler("admins", admins_cmd), group=0)
-    app.add_handler(CommandHandler("admin_add", admin_add_cmd), group=0)
-    app.add_handler(CommandHandler("admin_del", admin_del_cmd), group=0)
-    app.add_handler(CommandHandler("broadcast", broadcast_cmd), group=0)  # <- Handler untuk /broadcast
+
+    # /broadcast via CommandHandler
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd), group=0)
+    # Fallback regex: handle /broadcast@bot or case variations
+    app.add_handler(MessageHandler(filters.Regex(r'(?i)^/broadcast(@[A-Za-z0-9_]+)?(\s|$)'), broadcast_cmd), group=0)
 
     app.add_handler(CallbackQueryHandler(cb_handler), group=0)
     app.add_handler(MessageHandler(filters.ALL, handle_message), group=1)
