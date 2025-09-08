@@ -117,7 +117,7 @@ async def track(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
 # -------- Commands --------
 async def start_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot hidup. Coba /stats atau /broadcast (admin).")
+    await update.message.reply_text("Selamat datang di Nagabola! Temukan informasi dan promo menarik di bot Nagabola.")
 async def ping_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong")
 async def id_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
