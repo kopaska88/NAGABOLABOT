@@ -388,12 +388,54 @@ async def do_broadcast(context: ContextTypes.DEFAULT_TYPE, draft: BroadcastDraft
     await query.message.reply_text(f"Selesai. Terkirim: {sent}, Gagal: {failed}")
 
 # -------------- MAIN -----------------
-async def main_async():
-    # Pool Postgres
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-    await init_db(pool)
+import logging
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from telegram.request import HTTPXRequest
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+)
+logger = logging.getLogger("broadcast-bot")
+
+PORT = int(os.getenv("PORT", "8000"))  # Railway sometimes sends PORT
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/healthz":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+async def post_init_del_webhook(app):
+    # Pastikan tidak ada webhook yang aktif (kalau sebelumnya pernah pakai webhook)
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        me = await app.bot.get_me()
+        logger.info("Bot authorized as @%s (%s)", me.username, me.id)
+    except Exception as e:
+        logger.exception("POST_INIT error: %s", e)
+
+async def build_app(pool: asyncpg.Pool):
+    # Atur request client dengan timeout yang lebih longgar (Railway kadang lambat warm-up)
+    request = HTTPXRequest(
+        connect_timeout=15.0,
+        read_timeout=45.0,
+        write_timeout=15.0,
+        pool_timeout=15.0,
+    )
+
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .post_init(post_init_del_webhook)
+        .build()
+    )
+
     app.bot_data["pool"] = pool
 
     # Group 0: tracker interaksi (jalan duluan untuk semua update)
@@ -413,19 +455,35 @@ async def main_async():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.ALL, handle_message))
 
-    await app.initialize()
-    await app.start()
-    print("Bot started")
-    try:
-        await asyncio.Event().wait()
-    finally:
-        await app.stop()
-        await app.shutdown()
-        await pool.close()
+    return app
+
+async def serve_healthz():
+    # Jalankan HTTP server sederhana agar Railway menganggap service "up"
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    logger.info("Health server on :%s", PORT)
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, server.serve_forever)
+
+async def main_async():
+    # Pool Postgres
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    await init_db(pool)
+
+    app = await build_app(pool)
+
+    # Jalankan polling & health server bersamaan
+    async def run_polling():
+        # run_polling sudah handle initialize/start/idle/stop secara internal
+        await app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            close_loop=False,  # karena kita masih punya task lain
+        )
+
+    await asyncio.gather(run_polling(), serve_healthz())
 
 if __name__ == "__main__":
     try:
         asyncio.run(main_async())
     except (KeyboardInterrupt, SystemExit):
         pass
-
