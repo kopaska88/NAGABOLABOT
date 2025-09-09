@@ -1,9 +1,12 @@
-# Telegram Broadcast Bot — Users + Channels (Railway + PostgreSQL)
-# ENV wajib: BOT_TOKEN, OWNER_ID, DATABASE_URL, PORT (dari Railway)
+# Requirements (requirements.txt)
+# python-telegram-bot==21.6
+# asyncpg==0.29.0
+# httpx==0.27.2
+# python-dotenv==1.0.1  # optional
 
 import os, logging, threading, asyncio, re
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Dict
 import asyncpg
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -48,26 +51,17 @@ async def init_db(pool):
                 user_id BIGINT PRIMARY KEY
             )"""
         )
-        await con.execute(
-            """CREATE TABLE IF NOT EXISTS channels(
-                chat_id BIGINT PRIMARY KEY,
-                title TEXT,
-                username TEXT,
-                is_admin BOOLEAN NOT NULL DEFAULT FALSE,
-                last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )"""
-        )
         await con.execute("INSERT INTO admins(user_id) VALUES($1) ON CONFLICT DO NOTHING", OWNER_ID)
 
 async def upsert_user(pool, uid, first_name, username):
     async with pool.acquire() as con:
         await con.execute(
             """INSERT INTO users(user_id, first_name, username, last_seen)
-               VALUES($1,$2,$3,NOW())
-               ON CONFLICT (user_id) DO UPDATE SET
-                 first_name=EXCLUDED.first_name,
-                 username=EXCLUDED.username,
-                 last_seen=NOW()""",
+                   VALUES($1,$2,$3,NOW())
+                   ON CONFLICT (user_id) DO UPDATE SET
+                     first_name=EXCLUDED.first_name,
+                     username=EXCLUDED.username,
+                     last_seen=NOW()""",
             uid, first_name, username,
         )
 
@@ -108,53 +102,6 @@ async def get_all_user_ids(pool) -> List[int]:
         rows = await con.fetch("SELECT user_id FROM users")
         return [r[0] for r in rows]
 
-# ---- Channels table helpers ----
-async def upsert_channel(pool, chat_id:int, title:str, username:Optional[str], is_admin:bool):
-    async with pool.acquire() as con:
-        await con.execute(
-            """INSERT INTO channels(chat_id, title, username, is_admin, last_seen)
-               VALUES($1,$2,$3,$4,NOW())
-               ON CONFLICT (chat_id) DO UPDATE SET
-                 title=EXCLUDED.title,
-                 username=EXCLUDED.username,
-                 is_admin=EXCLUDED.is_admin,
-                 last_seen=NOW()""",
-            chat_id, title, username, is_admin,
-        )
-
-async def get_channels(pool, only_admin:bool=True) -> List[Tuple[int,str,Optional[str],bool]]:
-    async with pool.acquire() as con:
-        if only_admin:
-            rows = await con.fetch(
-                "SELECT chat_id,title,username,is_admin FROM channels WHERE is_admin=TRUE ORDER BY LOWER(title) NULLS LAST"
-            )
-        else:
-            rows = await con.fetch(
-                "SELECT chat_id,title,username,is_admin FROM channels ORDER BY is_admin DESC, LOWER(title) NULLS LAST"
-            )
-        return [(r[0], r[1], r[2], r[3]) for r in rows]
-
-async def find_channel_by_ref(pool, ref:str) -> Optional[Tuple[int,str,Optional[str],bool]]:
-    ref = (ref or "").strip()
-    if not ref:
-        return None
-    # @username
-    if ref.startswith("@"):
-        uname = ref[1:].lower()
-        async with pool.acquire() as con:
-            r = await con.fetchrow(
-                "SELECT chat_id,title,username,is_admin FROM channels WHERE LOWER(username)=$1", uname
-            )
-            return (r[0], r[1], r[2], r[3]) if r else None
-    # numeric id
-    try:
-        cid = int(ref)
-    except Exception:
-        return None
-    async with pool.acquire() as con:
-        r = await con.fetchrow("SELECT chat_id,title,username,is_admin FROM channels WHERE chat_id=$1", cid)
-        return (r[0], r[1], r[2], r[3]) if r else None
-
 # ---------------- State ----------------
 class Step:
     ASK_TEXT = "ASK_TEXT"
@@ -183,9 +130,6 @@ class Session:
     step: str = Step.IDLE
     draft: BroadcastDraft = field(default_factory=BroadcastDraft)
     temp_button_text: Optional[str] = None
-    # Target kontrol: default users; bisa channel_one / channels_all
-    target_mode: str = "users"   # users | channel_one | channels_all
-    target_chat_ids: Optional[List[int]] = None
 
 sessions: Dict[int, Session] = {}
 
@@ -196,8 +140,7 @@ def ensure_session(uid:int) -> Session:
 
 def yesno_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Ya", callback_data="btn_yes"),
-         InlineKeyboardButton("Tidak", callback_data="btn_no")]
+        [InlineKeyboardButton("Ya", callback_data="btn_yes"), InlineKeyboardButton("Tidak", callback_data="btn_no")]
     ])
 
 # ---------------- Health ----------------
@@ -222,33 +165,17 @@ async def debug_all(update:Update, context:ContextTypes.DEFAULT_TYPE):
         log.info("UPDATE callback from=%s data=%r (step=%s)", update.callback_query.from_user.id, update.callback_query.data, step)
     elif update.my_chat_member:
         log.info("UPDATE my_chat_member chat=%s status=%s", update.my_chat_member.chat.id, update.my_chat_member.new_chat_member.status)
-    elif getattr(update, "channel_post", None):
-        log.info("UPDATE channel_post chat=%s", update.channel_post.chat.id)
     else:
         log.info("UPDATE other: %s", update.to_dict())
 
 async def track(update:Update, context:ContextTypes.DEFAULT_TYPE):
     pool = context.application.bot_data.get("pool")
     u = update.effective_user
-    # track users
     if pool and u:
         try:
             await upsert_user(pool, u.id, u.first_name, u.username)
         except Exception as e:
             log.warning("track fail: %s", e)
-    # track channels via my_chat_member
-    try:
-        mc = update.my_chat_member
-        if mc and mc.chat and mc.chat.type == "channel":
-            chat = mc.chat
-            status = mc.new_chat_member.status  # 'administrator', 'member', 'left', 'kicked'
-            is_admin = (status == "administrator")
-            title = chat.title or "(tanpa judul)"
-            username = getattr(chat, "username", None)
-            await upsert_channel(pool, chat.id, title, username, is_admin)
-            log.info("Channel tracked: %s (%s) admin=%s", title, chat.id, is_admin)
-    except Exception as e:
-        log.warning("track channel fail: %s", e)
 
 # ---------------- Commands ----------------
 async def start_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -347,64 +274,6 @@ async def admin_regex_router(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if "admin_del" in txt:
         return await admin_del_cmd(update, context)
 
-# ---------------- Channels Commands ----------------
-async def channels_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data["pool"]
-    uid = update.effective_user.id
-    if not await is_admin(pool, uid):
-        return await update.message.reply_text("Khusus admin.")
-    rows = await get_channels(pool, only_admin=False)
-    if not rows:
-        return await update.message.reply_text("Belum ada channel yang terdeteksi. Tambahkan bot sebagai admin ke channel, lalu coba lagi.")
-    lines = []
-    for chat_id, title, username, is_admin in rows:
-        handle = f"@{username}" if username else "(tanpa username)"
-        tag = "ADMIN" if is_admin else "-"
-        lines.append(f"• {title} {handle}\n  id: <code>{chat_id}</code> | {tag}")
-    await update.message.reply_html("Daftar channel terdata:\n" + "\n".join(lines))
-
-async def post_channel_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data["pool"]
-    uid = update.effective_user.id
-    if not await is_admin(pool, uid):
-        return await update.message.reply_text("Khusus admin.")
-    # arg: @username atau chat_id
-    ref = " ".join(context.args) if context.args else ""
-    if not ref:
-        return await update.message.reply_text("Gunakan: /post_channel <@username|chat_id> — bot harus admin di channel tsb.")
-    ch = await find_channel_by_ref(pool, ref)
-    if not ch:
-        return await update.message.reply_text("Channel tidak ditemukan di database. Pastikan bot sudah ditambahkan sebagai admin dan coba /channels.")
-    chat_id, title, username, is_admin = ch
-    if not is_admin:
-        return await update.message.reply_text("Bot bukan admin di channel tersebut. Naikkan jadi admin dulu.")
-    s = ensure_session(uid)
-    s.step = Step.ASK_TEXT
-    s.draft = BroadcastDraft()
-    s.target_mode = "channel_one"
-    s.target_chat_ids = [chat_id]
-    return await update.message.reply_text(f"Posting ke channel: {title}.\nKirimkan *teks* untuk posting.", parse_mode=ParseMode.MARKDOWN)
-
-async def broadcast_channels_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data["pool"]
-    uid = update.effective_user.id
-    if not await is_admin(pool, uid):
-        return await update.message.reply_text("Khusus admin.")
-    rows = await get_channels(pool, only_admin=True)
-    if not rows:
-        return await update.message.reply_text("Tidak ada channel admin yang terdeteksi. Tambahkan bot sebagai admin ke channel, lalu coba lagi.")
-    s = ensure_session(uid)
-    s.step = Step.ASK_TEXT
-    s.draft = BroadcastDraft()
-    s.target_mode = "channels_all"
-    s.target_chat_ids = [r[0] for r in rows]
-    names = ", ".join((r[1] or str(r[0])) for r in rows[:5])
-    more = "" if len(rows) <= 5 else f" (+{len(rows)-5} lainnya)"
-    return await update.message.reply_text(
-        f"Broadcast ke {len(rows)} channel: {names}{more}.\nKirimkan *teks* untuk broadcast.",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
 # ---------------- Broadcast helpers ----------------
 async def send_preview_to_chat(context:ContextTypes.DEFAULT_TYPE, chat_id:int, draft:BroadcastDraft):
     rows = [[InlineKeyboardButton(b.text, url=b.url)] for b in draft.buttons]
@@ -438,8 +307,6 @@ async def broadcast_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     s = ensure_session(uid)
     s.step = Step.ASK_TEXT
     s.draft = BroadcastDraft()
-    s.target_mode = "users"
-    s.target_chat_ids = None
     await update.message.reply_text("Kirimkan *teks* untuk broadcast.", parse_mode=ParseMode.MARKDOWN)
 
 async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -455,7 +322,7 @@ async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if s.step == Step.ASK_TEXT:
         if not msg.text or msg.text.strip().lower() == "/broadcast":
             return await msg.reply_text("Silakan kirim teks isi broadcast.")
-        s.draft.text = msg.text  # HTML dibiarkan apa adanya
+        s.draft.text = msg.text_html
         s.step = Step.ASK_MEDIA
         return await msg.reply_text("Kirimkan *foto/GIF/video* (opsional) atau ketik *skip*.", parse_mode=ParseMode.MARKDOWN)
 
@@ -525,17 +392,9 @@ async def cb_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if s.step == Step.PREVIEW:
         if data == "preview_send":
             await query.edit_message_text("Mulai broadcast…")
-            # tentukan target
-            if s.target_mode in ("channel_one", "channels_all") and s.target_chat_ids:
-                targets = s.target_chat_ids
-            else:
-                pool = context.application.bot_data["pool"]
-                targets = await get_all_user_ids(pool)
-            await do_broadcast(context, s.draft, query, targets)
+            await do_broadcast(context, s.draft, query)
             s.step = Step.IDLE
             s.draft = BroadcastDraft()
-            s.target_mode = "users"
-            s.target_chat_ids = None
             return
         elif data == "preview_restart":
             s.step = Step.ASK_TEXT
@@ -544,11 +403,11 @@ async def cb_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
         elif data == "preview_cancel":
             s.step = Step.IDLE
             s.draft = BroadcastDraft()
-            s.target_mode = "users"
-            s.target_chat_ids = None
             return await query.edit_message_text("Broadcast dibatalkan.")
 
-async def do_broadcast(context:ContextTypes.DEFAULT_TYPE, draft:BroadcastDraft, query, targets:List[int]):
+async def do_broadcast(context:ContextTypes.DEFAULT_TYPE, draft:BroadcastDraft, query):
+    pool = context.application.bot_data["pool"]
+    targets = await get_all_user_ids(pool)
     sent = 0
     failed = 0
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(b.text, url=b.url)] for b in draft.buttons]) if draft.buttons else InlineKeyboardMarkup([])
@@ -601,8 +460,8 @@ def build_app():
     )
 
     # Order: debug (-2), track (-1), commands (0), callbacks (0), message flow (1)
-    app.add_handler(TypeHandler(Update, debug_all), group=-2)
-    app.add_handler(TypeHandler(Update, track), group=-1)
+    app.add_handler(TypeHandler(Update, debug_all, block=False), group=-2)
+    app.add_handler(TypeHandler(Update, track, block=False), group=-1)
 
     # Commands
     app.add_handler(CommandHandler("start", start_cmd), group=0)
@@ -616,12 +475,7 @@ def build_app():
     app.add_handler(CommandHandler("admin_del", admin_del_cmd), group=0)
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^/(admin_add|admin_del)(@[A-Za-z0-9_]+)?(\s|$)"), admin_regex_router), group=0)
 
-    # Channels: list & post
-    app.add_handler(CommandHandler("channels", channels_cmd), group=0)
-    app.add_handler(CommandHandler("post_channel", post_channel_cmd), group=0)           # /post_channel <@username|chat_id>
-    app.add_handler(CommandHandler("broadcast_channels", broadcast_channels_cmd), group=0)  # broadcast ke semua channel admin
-
-    # Broadcast (users default)
+    # Broadcast
     app.add_handler(CommandHandler("broadcast", broadcast_cmd), group=0)
     app.add_handler(MessageHandler(filters.Regex(r"(?i)^/broadcast(@[A-Za-z0-9_]+)?(\s|$)"), broadcast_cmd), group=0)
 
