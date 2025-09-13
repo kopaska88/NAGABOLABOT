@@ -18,6 +18,20 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 
+# ---------- Command sanitation for /setting content ----------
+_CMD_EDGE = re.compile(r"^\s*/(?:start|setting)(?:@[A-Za-z0-9_]+)?\s*", re.IGNORECASE)
+_CMD_EDGE_TAIL = re.compile(r"\s*/(?:start|setting)(?:@[A-Za-z0-9_]+)?\s*$", re.IGNORECASE)
+
+def sanitize_welcome(text: str) -> str:
+    if not text:
+        return ""
+    # Hapus command di awal/akhir bila ada
+    txt = _CMD_EDGE.sub("", text)
+    txt = _CMD_EDGE_TAIL.sub("", txt)
+    # Normalisasi spasi horizontal
+    txt = re.sub(r"[ \t]+", " ", txt).strip()
+    return txt
+
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
 log = logging.getLogger("nagabola-bot")
@@ -38,7 +52,7 @@ if not OWNER_ID:
 # ---------------- DB Layer ----------------
 async def init_db(pool):
     async with pool.acquire() as con:
-        # users & admins (existing)
+        # users & admins
         await con.execute(
             """CREATE TABLE IF NOT EXISTS users(
                 user_id BIGINT PRIMARY KEY,
@@ -61,7 +75,6 @@ async def init_db(pool):
                 value TEXT NOT NULL
             )"""
         )
-        # default welcome text if not set
         await con.execute(
             """INSERT INTO settings(key, value) VALUES($1, $2)
                ON CONFLICT (key) DO NOTHING""",
@@ -95,11 +108,11 @@ async def upsert_user(pool, uid, first_name, username):
     async with pool.acquire() as con:
         await con.execute(
             """INSERT INTO users(user_id, first_name, username, last_seen)
-                   VALUES($1,$2,$3,NOW())
-                   ON CONFLICT (user_id) DO UPDATE SET
-                     first_name=EXCLUDED.first_name,
-                     username=EXCLUDED.username,
-                     last_seen=NOW()""",
+               VALUES($1,$2,$3,NOW())
+               ON CONFLICT (user_id) DO UPDATE SET
+                 first_name=EXCLUDED.first_name,
+                 username=EXCLUDED.username,
+                 last_seen=NOW()""",
             uid, first_name, username,
         )
 
@@ -149,7 +162,8 @@ async def get_welcome_text(pool) -> str:
 async def set_welcome_text(pool, text:str):
     async with pool.acquire() as con:
         await con.execute(
-            "INSERT INTO settings(key,value) VALUES('welcome_text',$1) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+            "INSERT INTO settings(key,value) VALUES('welcome_text',$1) "
+            "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
             text
         )
 
@@ -211,7 +225,10 @@ def ensure_session(uid:int) -> Session:
     return sessions[uid]
 
 def yesno_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("Ya", callback_data="btn_yes"), InlineKeyboardButton("Tidak", callback_data="btn_no")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Ya", callback_data="btn_yes"),
+         InlineKeyboardButton("Tidak", callback_data="btn_no")]
+    ])
 
 # ---------------- Health ----------------
 class HealthHandler(BaseHTTPRequestHandler):
@@ -263,7 +280,6 @@ async def start_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN)
 
 async def ping_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    # Ping kita buat khusus admin agar non-admin hanya /start dan /link
     if not await require_admin_or_deny(update, context):
         return
     await update.message.reply_text("pong")
@@ -280,7 +296,9 @@ async def admins_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
         return
     pool = context.application.bot_data["pool"]
     ids = await get_admins(pool)
-    await update.message.reply_text("Daftar admin:\n" + "\n".join(f"- {i}" + (" (OWNER)" if i == OWNER_ID else "") for i in ids))
+    await update.message.reply_text(
+        "Daftar admin:\n" + "\n".join(f"- {i}" + (" (OWNER)" if i == OWNER_ID else "") for i in ids)
+    )
 
 # -------- Admin helpers --------
 _def_num = re.compile(r"(-?\d{5,20})")
@@ -360,8 +378,8 @@ async def help_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
         "/admin_add <user_id> - Tambah admin (OWNER saja)\n"
         "/admin_del <user_id> - Hapus admin (OWNER saja)\n"
         "/broadcast - Mulai alur broadcast ke semua user\n"
-        "/setting - Ubah pesan sambutan /start\n"
-        "/link - Lihat link promo (admin akan melihat tombol kelola: tambah/hapus)\n"
+        "/setting - Ubah pesan sambutan /start (dua langkah)\n"
+        "/link - Lihat link promo (admin bisa tambah/hapus)\n"
         "/ping - Tes koneksi\n\n"
         "_Catatan: Pengguna non-admin hanya bisa /start dan /link_"
     )
@@ -373,7 +391,11 @@ def _link_keyboard_for_all(rows: List[asyncpg.Record]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("Belum ada link", url="https://t.me")]])
 
 def _link_keyboard_admin(rows: List[asyncpg.Record]) -> InlineKeyboardMarkup:
-    kb_rows = [[InlineKeyboardButton(r["title"], url=r["url"]), InlineKeyboardButton("🗑 Hapus", callback_data=f"link_del:{r['id']}")] for r in rows]
+    kb_rows = [
+        [InlineKeyboardButton(r["title"], url=r["url"]),
+         InlineKeyboardButton("🗑 Hapus", callback_data=f"link_del:{r['id']}")]
+        for r in rows
+    ]
     kb_rows.append([InlineKeyboardButton("➕ Tambah Link", callback_data="link_add")])
     return InlineKeyboardMarkup(kb_rows)
 
@@ -404,7 +426,8 @@ async def setting_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     s = ensure_session(uid)
     s.step = Step.SET_WELCOME
     await update.message.reply_text(
-        "Kirim *teks sambutan baru* untuk /start (Markdown didukung).",
+        "Kirim *teks sambutan baru* untuk /start (Markdown didukung). "
+        "Hindari menyertakan command seperti /start atau /setting dalam konten.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -447,19 +470,22 @@ async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
     s = ensure_session(uid)
     msg = update.effective_message
 
-    # --- Non-admin gate: hanya izinkan /start & /link, lainnya diabaikan
+    # --- Non-admin gate: hanya izinkan /start & /link (flow non-admin tidak ada)
     if not await is_admin(pool, uid):
-        # hanya proses jika ini bagian dari command /start atau /link (yang sudah ditangani handler command)
-        # flow non-admin tidak ada, jadi return
         return
 
-    # --- Admin flows
+    # --- Admin flows ---
     if s.step == Step.SET_WELCOME:
-        if not msg.text:
-            return await msg.reply_text("Mohon kirim teks sambutan dalam format teks.")
-        await set_welcome_text(pool, msg.text)
+        cleaned = sanitize_welcome(msg.text or "")
+        # Jika setelah dibersihkan kosong atau hanya command, minta ulang
+        if not cleaned or cleaned.startswith("/") or cleaned.lower() in ("/start", "/setting"):
+            return await msg.reply_text(
+                "Pesan terlihat masih mengandung command. Kirim ulang teks sambutan *tanpa* /start atau /setting.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        await set_welcome_text(pool, cleaned)
         s.step = Step.IDLE
-        return await msg.reply_text("✅ Pesan sambutan /start berhasil diperbarui.")
+        return await msg.reply_text("✅ Pesan sambutan berhasil diperbarui.")
 
     if s.step == Step.ASK_TEXT:
         if not msg.text or msg.text.strip().lower() == "/broadcast":
