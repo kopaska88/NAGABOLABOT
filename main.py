@@ -10,13 +10,17 @@ from typing import List, Optional, Dict, Tuple
 import asyncpg
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, MessageEntity, User
+from telegram import (
+    Update, InlineKeyboardMarkup, InlineKeyboardButton,
+    MessageEntity, User
+)
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters, TypeHandler
 )
 from telegram.request import HTTPXRequest
+from telegram.error import TelegramError
 
 # ---------- Command sanitation for /setting content ----------
 _CMD_EDGE = re.compile(r"^\s*/(?:start|setting)(?:@[A-Za-z0-9_]+)?\s*", re.IGNORECASE)
@@ -284,7 +288,7 @@ async def debug_all(update:Update, context:ContextTypes.DEFAULT_TYPE):
         log.info("UPDATE other: %s", update.to_dict())
 
 async def track(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data.get("pool")
+    pool = get_pool(context)
     u = update.effective_user
     if pool and u:
         try:
@@ -294,19 +298,19 @@ async def track(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
 # ---------------- Helpers: reply & id resolution ----------------
 async def safe_reply(update:Update, text:str, **kwargs):
-    """
-    Balas dengan preferensi: message -> callback message chat -> effective_chat.
-    """
+    """Balas dengan preferensi: message -> callback message chat -> effective_chat."""
     try:
         if update.message:
             return await update.message.reply_text(text, **kwargs)
-        if update.callback_query:
-            chat_id = update.callback_query.message.chat_id
+        if update.callback_query and update.callback_query.message:
             return await update.callback_query.message.reply_text(text, **kwargs)
         if update.effective_chat:
             return await update.effective_chat.send_message(text, **kwargs)
     except Exception as e:
         log.warning("safe_reply error: %s", e)
+
+def get_pool(context: ContextTypes.DEFAULT_TYPE):
+    return context.application.bot_data.get("pool")
 
 _NUM_ID = re.compile(r"(-?\d{4,20})")  # toleransi min 4 digit
 _USERNAME = re.compile(r"^@?([A-Za-z0-9_]{4,})$")
@@ -349,31 +353,31 @@ async def resolve_user_id(update:Update, context:ContextTypes.DEFAULT_TYPE) -> T
     if uid:
         return uid, "numeric"
 
-    # 3) username token
+    # 3) username token / mention entity
     uname = None
     if args:
         uname = _username_from_text(args[0])
-    if not uname and text:
-        # cek entity mention
-        if update.message and update.message.entities:
-            for ent in update.message.entities:
-                if ent.type in (MessageEntity.MENTION, MessageEntity.TEXT_MENTION):
-                    if ent.type == MessageEntity.TEXT_MENTION and ent.user:
-                        return ent.user.id, "text_mention"
-                    frag = text[ent.offset: ent.offset + ent.length]
-                    uname = _username_from_text(frag)
-                    if uname:
-                        break
+    if not uname and text and update.message and update.message.entities:
+        for ent in update.message.entities:
+            if ent.type in (MessageEntity.MENTION, MessageEntity.TEXT_MENTION):
+                if ent.type == MessageEntity.TEXT_MENTION and ent.user:
+                    return ent.user.id, "text_mention"
+                frag = text[ent.offset: ent.offset + ent.length]
+                uname = _username_from_text(frag)
+                if uname:
+                    break
     if uname:
-        # Tidak ada endpoint resolve @username -> id dari tg secara server-side,
-        # jadi minta user untuk reply ke pesan target agar dapat id akurat.
+        # Tidak bisa resolve username -> id tanpa data chat; minta reply/ID numerik
         return None, f"username:{uname}"
 
     return None, None
 
 # ---------------- Permission Helper ----------------
 async def ensure_admin(update:Update, context:ContextTypes.DEFAULT_TYPE) -> bool:
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
+    if not pool:
+        await safe_reply(update, "⚠️ Bot belum siap (DB belum terhubung). Coba lagi sebentar.")
+        return False
     uid = update.effective_user.id
     if not await is_admin(pool, uid):
         await safe_reply(update, "Maaf, perintah ini khusus admin.")
@@ -381,7 +385,10 @@ async def ensure_admin(update:Update, context:ContextTypes.DEFAULT_TYPE) -> bool
     return True
 
 async def ensure_owner(update:Update, context:ContextTypes.DEFAULT_TYPE) -> bool:
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
+    if not pool:
+        await safe_reply(update, "⚠️ Bot belum siap (DB belum terhubung). Coba lagi sebentar.")
+        return False
     uid = update.effective_user.id
     owner_id = await get_owner_id(pool)
     if uid != owner_id:
@@ -391,7 +398,9 @@ async def ensure_owner(update:Update, context:ContextTypes.DEFAULT_TYPE) -> bool
 
 # ---------------- Commands ----------------
 async def start_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
+    if not pool:
+        return await safe_reply(update, "🤖 Bot sedang inisialisasi. Coba lagi sebentar.")
     welcome_text = await get_welcome_text(pool)
     await safe_reply(update, welcome_text, parse_mode=ParseMode.MARKDOWN)
 
@@ -403,14 +412,14 @@ async def ping_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def stats_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await ensure_admin(update, context):
         return
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
     total = await count_users(pool)
     await safe_reply(update, f"👥 Total pengguna terdaftar: {total}")
 
 async def admins_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await ensure_admin(update, context):
         return
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
     ids = await get_admins(pool)
     owner_id = await get_owner_id(pool)
     lines = []
@@ -425,7 +434,7 @@ async def admins_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def admin_add_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await ensure_owner(update, context):
         return
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
     target_id, how = await resolve_user_id(update, context)
     if not target_id:
         hint = ""
@@ -438,7 +447,7 @@ async def admin_add_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def admin_del_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await ensure_owner(update, context):
         return
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
     target_id, how = await resolve_user_id(update, context)
     if not target_id:
         return await safe_reply(update, "Gunakan /admin_del <user_id> atau reply pesan user.")
@@ -448,28 +457,48 @@ async def admin_del_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     await safe_reply(update, f"✅ Admin dihapus: {target_id}")
 
 async def owner_show_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    if not await ensure_admin(update, context):
-        return
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
+    if not pool:
+        return await safe_reply(update, "🤖 Bot sedang inisialisasi. Coba lagi sebentar.")
+    uid = update.effective_user.id
+    isadm = await is_admin(pool, uid)
+    if not isadm:
+        return await safe_reply(update, "Maaf, perintah ini khusus admin.")
     owner_id = await get_owner_id(pool)
     await safe_reply(update, f"👑 OWNER saat ini: {owner_id}")
 
 async def owner_set_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await ensure_owner(update, context):
         return
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
     target_id, how = await resolve_user_id(update, context)
     if not target_id:
         return await safe_reply(update, "Gunakan /owner_set <user_id> atau reply pesan user untuk memindahkan kepemilikan.")
     await set_owner_id(pool, target_id)
-    # Optional: hapus dari admins agar rapi (owner implicit admin)
+    # Optional: pastikan owner tidak tercatat di admins (owner implicit admin)
     await del_admin(pool, target_id)  # tidak masalah jika bukan admin
     await safe_reply(update, f"✅ OWNER dipindahkan ke: {target_id}")
 
-# ---------------- HELP (Admin only) ----------------
+# ---------------- HELP (publik & admin) ----------------
 async def help_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    if not await ensure_admin(update, context):
-        return
+    pool = get_pool(context)
+    if not pool:
+        return await safe_reply(update,
+            "🤖 Bot sedang inisialisasi.\n\nPerintah umum:\n/start – Tampilkan sambutan\n/link – Lihat link promo\n\nCoba lagi sebentar ya."
+        )
+
+    uid = update.effective_user.id
+    isadm = await is_admin(pool, uid)
+
+    if not isadm:
+        pub = (
+            "🤖 *Bantuan*\n\n"
+            "/start – Tampilkan sambutan\n"
+            "/link – Lihat link promo\n\n"
+            "_Catatan: Perintah admin hanya untuk admin/owner._"
+        )
+        return await safe_reply(update, pub, parse_mode=ParseMode.MARKDOWN)
+
     text = (
         "🛠 *Bantuan Admin NAGABOLA*\n\n"
         "/help - Tampilkan bantuan ini\n"
@@ -481,9 +510,9 @@ async def help_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
         "/owner_set <user_id> - Pindah OWNER (OWNER saja, bisa via reply)\n"
         "/broadcast - Mulai alur broadcast ke semua user\n"
         "/setting - Ubah pesan sambutan /start (dua langkah)\n"
-        "/link - Lihat link promo (admin bisa tambah/hapus)\n"
+        "/link - Lihat/kelola link promo\n"
         "/ping - Tes koneksi\n\n"
-        "_Catatan: Pengguna non-admin hanya bisa /start dan /link_"
+        "_Pengguna non-admin hanya /start dan /link_"
     )
     await safe_reply(update, text, parse_mode=ParseMode.MARKDOWN)
 
@@ -502,7 +531,9 @@ def _link_keyboard_admin(rows: List[asyncpg.Record]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(kb_rows)
 
 async def link_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
+    if not pool:
+        return await safe_reply(update, "⚠️ Bot belum siap (DB belum terhubung).")
     uid = update.effective_user.id
     isadm = await is_admin(pool, uid)
 
@@ -570,13 +601,13 @@ async def broadcast_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     await safe_reply(update, "Kirimkan *teks* untuk broadcast.", parse_mode=ParseMode.MARKDOWN)
 
 async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
     uid = update.effective_user.id
     s = ensure_session(uid)
     msg = update.effective_message
 
-    # --- Non-admin gate: hanya izinkan /start & /link (flow non-admin tidak ada)
-    if not await is_admin(pool, uid):
+    # --- Non-admin gate: hanya izinkan /start & /link via command handler (flow non-admin tidak ada)
+    if not pool or not await is_admin(pool, uid):
         return
 
     # --- Admin flows ---
@@ -595,7 +626,9 @@ async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if s.step == Step.ASK_TEXT:
         if not msg.text or msg.text.strip().lower() == "/broadcast":
             return await safe_reply(update, "Silakan kirim teks isi broadcast.")
-        s.draft.text = msg.text_html
+        # gunakan text_html bila tersedia, fallback ke text
+        text_html = getattr(msg, "text_html", None) or msg.text
+        s.draft.text = text_html
         s.step = Step.ASK_MEDIA
         return await safe_reply(update, "Kirimkan *foto/GIF/video* (opsional) atau ketik *skip*.", parse_mode=ParseMode.MARKDOWN)
 
@@ -664,8 +697,11 @@ async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def cb_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    pool = get_pool(context)
+    if not pool:
+        return await query.edit_message_text("⚠️ Bot belum siap (DB belum terhubung).")
+
     uid = query.from_user.id
-    pool = context.application.bot_data["pool"]
     s = ensure_session(uid)
     data = query.data
     log.info("Callback data=%s step=%s uid=%s", data, s.step, uid)
@@ -726,7 +762,9 @@ async def cb_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
             return await send_preview_to_chat(context, query.message.chat_id, s.draft)
 
 async def do_broadcast(context:ContextTypes.DEFAULT_TYPE, draft:BroadcastDraft, query):
-    pool = context.application.bot_data["pool"]
+    pool = get_pool(context)
+    if not pool:
+        return await query.message.reply_text("⚠️ DB tidak siap; broadcast dibatalkan.")
     targets = await get_all_user_ids(pool)
     sent = 0
     failed = 0
@@ -750,6 +788,20 @@ async def do_broadcast(context:ContextTypes.DEFAULT_TYPE, draft:BroadcastDraft, 
             await asyncio.sleep(0.3)
 
     await query.message.reply_text(f"Selesai. Terkirim: {sent}, Gagal: {failed}")
+
+# ---------------- Health command & Global Error Handler ----------------
+async def health_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    pool = get_pool(context)
+    ok = "OK" if pool else "POOL-NONE"
+    await safe_reply(update, f"healthz: {ok}")
+
+async def on_error(update: object, context):
+    log.exception("Unhandled error", exc_info=context.error)
+    try:
+        if isinstance(update, Update):
+            await safe_reply(update, "❌ Terjadi kesalahan tak terduga. Log sudah direkam.")
+    except TelegramError:
+        pass
 
 # ---------------- Lifecycle ----------------
 async def post_init(app):
@@ -788,9 +840,10 @@ def build_app():
     # PUBLIC commands
     app.add_handler(CommandHandler("start", start_cmd), group=0)
     app.add_handler(CommandHandler("link", link_cmd), group=0)
+    app.add_handler(CommandHandler("help", help_cmd), group=0)
+    app.add_handler(CommandHandler("health", health_cmd), group=0)
 
     # ADMIN/OWNER commands
-    app.add_handler(CommandHandler("help", help_cmd), group=0)
     app.add_handler(CommandHandler("ping", ping_cmd), group=0)
     app.add_handler(CommandHandler("stats", stats_cmd), group=0)
     app.add_handler(CommandHandler("admins", admins_cmd), group=0)
@@ -801,12 +854,16 @@ def build_app():
     app.add_handler(CommandHandler("owner_show", owner_show_cmd), group=0)
     app.add_handler(CommandHandler("owner_set", owner_set_cmd), group=0)
 
+    # Broadcast & Setting
     app.add_handler(CommandHandler("broadcast", broadcast_cmd), group=0)
     app.add_handler(CommandHandler("setting", setting_cmd), group=0)
 
     # Callback + message flow
     app.add_handler(CallbackQueryHandler(cb_handler), group=0)
     app.add_handler(MessageHandler(filters.ALL, handle_message), group=1)
+
+    # Global error handler
+    app.add_error_handler(on_error)
 
     return app
 
