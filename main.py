@@ -396,7 +396,7 @@ async def start_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def ping_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await ensure_admin(update, context):
         return
-    await safe_reply(update, "pong")
+    await safe_reply(update, "koneksi bot dengan server aman bro")
 
 async def stats_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await ensure_admin(update, context):
