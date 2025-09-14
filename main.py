@@ -534,7 +534,7 @@ async def link_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     else:
         return await safe_reply(
             update,
-            "🔗 <b>Link Promo</b>\nSilakan pilih:",
+            "🔗 <b>Link Promo</b>\n𝐋𝐈𝐒𝐓 𝐋𝐈𝐍𝐊 𝐏𝐑𝐎𝐌𝐎 𝐃𝐀𝐍 𝐋𝐈𝐍𝐊 𝐀𝐋𝐓𝐄𝐑𝐍𝐀𝐓𝐈𝐅",
             reply_markup=_link_keyboard_for_all(rows),
             parse_mode=ParseMode.HTML
         )
