@@ -36,7 +36,7 @@ def sanitize_welcome(text: str) -> str:
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
-log = logging.getLogger("nagabola-bot")
+log = logging.getLogger("NAGABOLA-bot")
 
 # ---------------- Env ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -73,6 +73,7 @@ async def init_db(pool):
                 value TEXT NOT NULL
             )"""
         )
+        # Texts
         await con.execute(
             """INSERT INTO settings(key, value) VALUES($1, $2)
                ON CONFLICT (key) DO NOTHING""",
@@ -81,10 +82,31 @@ async def init_db(pool):
             "Temukan info & promo eksklusif di sini. Ketik /link untuk lihat tautan promo terbaru."
         )
         await con.execute(
+            """INSERT INTO settings(key, value) VALUES($1, $2)
+               ON CONFLICT (key) DO NOTHING""",
+            "default_text",
+            "Halo! Pesanmu sudah kami terima 👋\n\nKetik /link untuk melihat tautan promo & bantuan cepat."
+        )
+        # Toggles khusus (bukan link promo)
+        await con.execute(
+            """INSERT INTO settings(key, value) VALUES($1, $2)
+               ON CONFLICT (key) DO NOTHING""",
+            "start_buttons_on",
+            "true"
+        )
+        await con.execute(
+            """INSERT INTO settings(key, value) VALUES($1, $2)
+               ON CONFLICT (key) DO NOTHING""",
+            "default_buttons_on",
+            "false"
+        )
+        # Owner id store
+        await con.execute(
             """INSERT INTO settings(key, value) VALUES('owner_id', $1)
                ON CONFLICT (key) DO NOTHING""",
             str(ENV_OWNER_ID)
         )
+        # Promo links (fitur lama tetap ada, tapi tidak dipakai untuk start/default)
         await con.execute(
             """CREATE TABLE IF NOT EXISTS promo_links(
                 id SERIAL PRIMARY KEY,
@@ -102,6 +124,42 @@ async def init_db(pool):
                     ("Claim Bonus", "https://example.com/bonus", 2),
                     ("Live Chat", "https://example.com/livechat", 3),
                 ],
+            )
+        # Tombol khusus START
+        await con.execute(
+            """CREATE TABLE IF NOT EXISTS start_buttons(
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                url TEXT NOT NULL,
+                position INT NOT NULL DEFAULT 0
+            )"""
+        )
+        # Isi default jika kosong
+        scount = await con.fetchval("SELECT COUNT(*) FROM start_buttons")
+        if int(scount or 0) == 0:
+            await con.executemany(
+                "INSERT INTO start_buttons(text,url,position) VALUES($1,$2,$3)",
+                [
+                    ("Daftar", "https://example.com/daftar", 1),
+                    ("Bantuan", "https://example.com/help", 2),
+                ]
+            )
+        # Tombol khusus DEFAULT REPLY
+        await con.execute(
+            """CREATE TABLE IF NOT EXISTS default_buttons(
+                id SERIAL PRIMARY KEY,
+                text TEXT NOT NULL,
+                url TEXT NOT NULL,
+                position INT NOT NULL DEFAULT 0
+            )"""
+        )
+        dcount = await con.fetchval("SELECT COUNT(*) FROM default_buttons")
+        if int(dcount or 0) == 0:
+            await con.executemany(
+                "INSERT INTO default_buttons(text,url,position) VALUES($1,$2,$3)",
+                [
+                    ("Lihat Link", "https://example.com/link", 1),
+                ]
             )
 
 async def upsert_user(pool, uid, first_name, username):
@@ -177,19 +235,50 @@ async def get_all_user_ids(pool) -> List[int]:
         rows = await con.fetch("SELECT user_id FROM users")
         return [r[0] for r in rows]
 
-async def get_welcome_text(pool) -> str:
+# ---- Settings helpers (texts & toggles)
+async def _get_setting(pool, key:str, default:str="") -> str:
     async with pool.acquire() as con:
-        val = await con.fetchval("SELECT value FROM settings WHERE key='welcome_text'")
-        return val or "Selamat datang di *NAGABOLA*!"
+        val = await con.fetchval("SELECT value FROM settings WHERE key=$1", key)
+        return val if val is not None else default
 
-async def set_welcome_text(pool, text:str):
+async def _set_setting(pool, key:str, value:str):
     async with pool.acquire() as con:
         await con.execute(
-            "INSERT INTO settings(key,value) VALUES('welcome_text',$1) "
+            "INSERT INTO settings(key,value) VALUES($1,$2) "
             "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
-            text
+            key, value
         )
 
+async def _get_bool(pool, key:str, default:bool=False) -> bool:
+    val = await _get_setting(pool, key, "true" if default else "false")
+    return str(val).strip().lower() in ("1","true","yes","on")
+
+async def _toggle_bool(pool, key:str) -> bool:
+    cur = await _get_bool(pool, key, False)
+    await _set_setting(pool, key, "true" if not cur else "false")
+    return not cur
+
+async def get_welcome_text(pool) -> str:
+    return await _get_setting(pool, "welcome_text",
+        "Selamat datang di *NAGABOLA*!")
+
+async def set_welcome_text(pool, text:str):
+    await _set_setting(pool, "welcome_text", text)
+
+async def get_default_text(pool) -> str:
+    return await _get_setting(pool, "default_text",
+        "Halo! Ketik /link untuk melihat tautan promo.")
+
+async def set_default_text(pool, text:str):
+    await _set_setting(pool, "default_text", text)
+
+async def start_buttons_enabled(pool) -> bool:
+    return await _get_bool(pool, "start_buttons_on", True)
+
+async def default_buttons_enabled(pool) -> bool:
+    return await _get_bool(pool, "default_buttons_on", False)
+
+# ---- Promo links (tetap ada, terpisah)
 async def list_links(pool):
     async with pool.acquire() as con:
         return await con.fetch("SELECT id,title,url FROM promo_links ORDER BY position, id")
@@ -205,6 +294,38 @@ async def delete_link(pool, link_id:int) -> bool:
         res = await con.execute("DELETE FROM promo_links WHERE id=$1", link_id)
         return res.endswith("1")
 
+# ---- START buttons CRUD
+async def list_start_buttons(pool):
+    async with pool.acquire() as con:
+        return await con.fetch("SELECT id,text,url FROM start_buttons ORDER BY position, id")
+
+async def add_start_button(pool, text:str, url:str):
+    async with pool.acquire() as con:
+        maxpos = await con.fetchval("SELECT COALESCE(MAX(position),0) FROM start_buttons")
+        nextpos = int(maxpos or 0) + 1
+        await con.execute("INSERT INTO start_buttons(text,url,position) VALUES($1,$2,$3)", text, url, nextpos)
+
+async def delete_start_button(pool, btn_id:int) -> bool:
+    async with pool.acquire() as con:
+        res = await con.execute("DELETE FROM start_buttons WHERE id=$1", btn_id)
+        return res.endswith("1")
+
+# ---- DEFAULT buttons CRUD
+async def list_default_buttons(pool):
+    async with pool.acquire() as con:
+        return await con.fetch("SELECT id,text,url FROM default_buttons ORDER BY position, id")
+
+async def add_default_button(pool, text:str, url:str):
+    async with pool.acquire() as con:
+        maxpos = await con.fetchval("SELECT COALESCE(MAX(position),0) FROM default_buttons")
+        nextpos = int(maxpos or 0) + 1
+        await con.execute("INSERT INTO default_buttons(text,url,position) VALUES($1,$2,$3)", text, url, nextpos)
+
+async def delete_default_button(pool, btn_id:int) -> bool:
+    async with pool.acquire() as con:
+        res = await con.execute("DELETE FROM default_buttons WHERE id=$1", btn_id)
+        return res.endswith("1")
+
 # ---------------- State ----------------
 class Step:
     ASK_TEXT = "ASK_TEXT"
@@ -216,6 +337,12 @@ class Step:
     SET_WELCOME = "SET_WELCOME"
     ADD_LINK_TITLE = "ADD_LINK_TITLE"
     ADD_LINK_URL = "ADD_LINK_URL"
+    SET_DEFAULT = "SET_DEFAULT"
+    # Baru: add button START / DEFAULT
+    ADD_SB_TEXT = "ADD_SB_TEXT"
+    ADD_SB_URL = "ADD_SB_URL"
+    ADD_DB_TEXT = "ADD_DB_TEXT"
+    ADD_DB_URL = "ADD_DB_URL"
     IDLE = "IDLE"
 
 @dataclass
@@ -237,6 +364,9 @@ class Session:
     draft: BroadcastDraft = field(default_factory=BroadcastDraft)
     temp_button_text: Optional[str] = None
     temp_link_title: Optional[str] = None
+    # untuk add tombol start/default
+    temp_sb_text: Optional[str] = None
+    temp_db_text: Optional[str] = None
 
 sessions: Dict[int, Session] = {}
 
@@ -384,14 +514,54 @@ async def ensure_owner(update:Update, context:ContextTypes.DEFAULT_TYPE) -> bool
         return False
     return True
 
+# ---------------- UI helpers (keyboards)
+def _keyboard_from_rows(rows: List[asyncpg.Record]) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(r["text"], url=r["url"])] for r in rows]
+    return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("Belum ada tombol", url="https://t.me")]])
+
+def _link_keyboard_for_all(rows: List[asyncpg.Record]) -> InlineKeyboardMarkup:
+    buttons = [[InlineKeyboardButton(r["title"], url=r["url"])] for r in rows]
+    return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("Belum ada link", url="https://t.me")]])
+
+def _link_keyboard_admin(rows: List[asyncpg.Record]) -> InlineKeyboardMarkup:
+    kb_rows = [
+        [InlineKeyboardButton(r["title"], url=r["url"]),
+         InlineKeyboardButton("🗑 Hapus", callback_data=f"link_del:{r['id']}")]
+        for r in rows
+    ]
+    kb_rows.append([InlineKeyboardButton("➕ Tambah Link", callback_data="link_add")])
+    return InlineKeyboardMarkup(kb_rows)
+
+def _start_buttons_admin(rows: List[asyncpg.Record]) -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton(r["text"], url=r["url"]),
+         InlineKeyboardButton("🗑", callback_data=f"sb_del:{r['id']}")]
+        for r in rows
+    ]
+    kb.append([InlineKeyboardButton("➕ Tambah Tombol /start", callback_data="sb_add")])
+    return InlineKeyboardMarkup(kb)
+
+def _default_buttons_admin(rows: List[asyncpg.Record]) -> InlineKeyboardMarkup:
+    kb = [
+        [InlineKeyboardButton(r["text"], url=r["url"]),
+         InlineKeyboardButton("🗑", callback_data=f"db_del:{r['id']}")]
+        for r in rows
+    ]
+    kb.append([InlineKeyboardButton("➕ Tambah Tombol Default", callback_data="db_add")])
+    return InlineKeyboardMarkup(kb)
+
 # ---------------- Commands ----------------
 async def start_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     pool = get_pool(context)
     if not pool:
         return await safe_reply(update, "🤖 Bot sedang inisialisasi. Coba lagi sebentar.")
     welcome_text = await get_welcome_text(pool)
-    # tetap Markdown karena memang didesain untuk itu
-    await safe_reply(update, welcome_text, parse_mode=ParseMode.MARKDOWN)
+    use_buttons = await start_buttons_enabled(pool)
+    kb = None
+    if use_buttons:
+        rows = await list_start_buttons(pool)
+        kb = _keyboard_from_rows(rows)
+    await safe_reply(update, welcome_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
 
 async def ping_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await ensure_admin(update, context):
@@ -462,10 +632,10 @@ async def owner_set_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not target_id:
         return await safe_reply(update, "Gunakan /owner_set <user_id> atau reply pesan user untuk memindahkan kepemilikan.")
     await set_owner_id(pool, target_id)
-    await del_admin(pool, target_id)  # opsional: bersihkan
+    await del_admin(pool, target_id)  # opsional
     await safe_reply(update, f"✅ OWNER dipindahkan ke: {target_id}")
 
-# ---------------- HELP (HTML agar aman dari _) ----------------
+# ---------------- HELP ----------------
 async def help_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     pool = get_pool(context)
     if not pool:
@@ -481,53 +651,37 @@ async def help_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
             "<b>🤖 Bantuan</b>\n\n"
             "<code>/start</code> – Tampilkan sambutan\n"
             "<code>/link</code> – Lihat link promo\n\n"
-            "<i>Catatan: Perintah admin hanya untuk admin/owner.</i>"
+            "<i>Kirim pesan apa saja untuk menerima jawaban default.</i>"
         )
         return await safe_reply(update, pub, parse_mode=ParseMode.HTML)
 
     text = (
         "<b>🛠 Bantuan Admin NAGABOLA</b>\n\n"
-        "<code>/help</code> - Tampilkan bantuan ini\n"
-        "<code>/stats</code> - Jumlah pengguna terdaftar\n"
-        "<code>/admins</code> - Daftar admin & owner\n"
-        "<code>/admin_add &lt;user_id&gt;</code> - Tambah admin (OWNER saja, bisa via reply)\n"
-        "<code>/admin_del &lt;user_id&gt;</code> - Hapus admin (OWNER saja, bisa via reply)\n"
-        "<code>/owner_show</code> - Lihat OWNER saat ini\n"
-        "<code>/owner_set &lt;user_id&gt;</code> - Pindah OWNER (OWNER saja, bisa via reply)\n"
-        "<code>/broadcast</code> - Mulai alur broadcast ke semua user\n"
-        "<code>/setting</code> - Ubah pesan sambutan /start (dua langkah)\n"
-        "<code>/link</code> - Lihat/kelola link promo\n"
-        "<code>/ping</code> - Tes koneksi\n\n"
-        "<i>Pengguna non-admin hanya /start dan /link</i>"
+        "/stats - Jumlah pengguna \n"
+        "/admins - Daftar admin\n"
+        "/admin_add - Tambah admin\n"
+        "/admin_del - Hapus admin\n"
+        "/owner_show - Lihat OWNER\n"
+        "/owner_set - Pindah OWNER\n"
+        "/broadcast - Mulai broadcast\n"
+        "/setting - Panel pengaturan\n"
+        "/link - Lihat/kelola link\n"
+        "/ping - Tes koneksi\n"
     )
     return await safe_reply(update, text, parse_mode=ParseMode.HTML)
 
-# ---------------- LINK ----------------
-def _link_keyboard_for_all(rows: List[asyncpg.Record]) -> InlineKeyboardMarkup:
-    buttons = [[InlineKeyboardButton(r["title"], url=r["url"])] for r in rows]
-    return InlineKeyboardMarkup(buttons or [[InlineKeyboardButton("Belum ada link", url="https://t.me")]])
-
-def _link_keyboard_admin(rows: List[asyncpg.Record]) -> InlineKeyboardMarkup:
-    kb_rows = [
-        [InlineKeyboardButton(r["title"], url=r["url"]),
-         InlineKeyboardButton("🗑 Hapus", callback_data=f"link_del:{r['id']}")]
-        for r in rows
-    ]
-    kb_rows.append([InlineKeyboardButton("➕ Tambah Link", callback_data="link_add")])
-    return InlineKeyboardMarkup(kb_rows)
-
+# ---------------- LINK (fitur lama) ----------------
 async def link_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     pool = get_pool(context)
     if not pool:
         return await safe_reply(update, "⚠️ Bot belum siap (DB belum terhubung).")
     uid = update.effective_user.id
     isadm = await is_admin(pool, uid)
-
     rows = await list_links(pool)
     if isadm:
         return await safe_reply(
             update,
-            "🔗 <b>Link Promo</b>\nAdmin dapat menambah/hapus link dari tombol di bawah.",
+            "🔗 <b>Link Promo</b>\nAdmin dapat menambah/hapus link dari tombol di bawah.\n(Catatan: tidak mempengaruhi tombol /start dan Pesan Default)",
             reply_markup=_link_keyboard_admin(rows),
             parse_mode=ParseMode.HTML
         )
@@ -539,18 +693,34 @@ async def link_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.HTML
         )
 
-# ---------------- SETTING ----------------
+# ---------------- SETTING (Panel) ----------------
+def _settings_menu_markup(start_on:bool, default_on:bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Ubah teks /start", callback_data="set_welcome")],
+        [InlineKeyboardButton(f"{'🟢' if start_on else '🔴'} Tombol di /start: "
+                              f"{'ON' if start_on else 'OFF'}", callback_data="toggle_start_btn")],
+        [InlineKeyboardButton("⚙️ Kelola Tombol /start", callback_data="open_start_btn_admin")],
+        [InlineKeyboardButton("💬 Ubah teks default", callback_data="set_default")],
+        [InlineKeyboardButton(f"{'🟢' if default_on else '🔴'} Tombol di Pesan Default: "
+                              f"{'ON' if default_on else 'OFF'}", callback_data="toggle_default_btn")],
+        [InlineKeyboardButton("⚙️ Kelola Tombol Default", callback_data="open_default_btn_admin")],
+        [InlineKeyboardButton("🔗 Kelola Link Promo (terpisah)", callback_data="open_link_admin")]
+    ])
+
 async def setting_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if not await ensure_admin(update, context):
         return
-    uid = update.effective_user.id
-    s = ensure_session(uid)
-    s.step = Step.SET_WELCOME
+    pool = get_pool(context)
+    start_on = await start_buttons_enabled(pool)
+    default_on = await default_buttons_enabled(pool)
     await safe_reply(
         update,
-        "Kirim <b>teks sambutan baru</b> untuk /start (Markdown didukung). "
-        "Hindari menyertakan command seperti /start atau /setting dalam konten.",
-        parse_mode=ParseMode.HTML
+        "<b>Panel Pengaturan</b>\n\n"
+        "• Atur teks /start & tombolnya (khusus tabel start_buttons)\n"
+        "• Atur teks Default & tombolnya (khusus tabel default_buttons)\n"
+        "• Link Promo tetap ada namun <i>tidak mempengaruhi</i> tombol /start & Default.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_settings_menu_markup(start_on, default_on)
     )
 
 # ---------------- Broadcast helpers & flow ----------------
@@ -593,94 +763,174 @@ async def broadcast_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
     s.draft = BroadcastDraft()
     await safe_reply(update, "Kirimkan <b>teks</b> untuk broadcast.", parse_mode=ParseMode.HTML)
 
+# ---------------- Default reply helper ----------------
+async def send_default_reply(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    pool = get_pool(context)
+    if not pool:
+        return
+    txt = await get_default_text(pool)
+    use_buttons = await default_buttons_enabled(pool)
+    kb = None
+    if use_buttons:
+        rows = await list_default_buttons(pool)
+        kb = _keyboard_from_rows(rows)
+    await safe_reply(update, txt, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+
+# ---------------- Message flow (admin steps + public default)
 async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
     pool = get_pool(context)
     uid = update.effective_user.id
     s = ensure_session(uid)
     msg = update.effective_message
 
-    if not pool or not await is_admin(pool, uid):
+    if not pool:
         return
 
-    if s.step == Step.SET_WELCOME:
-        cleaned = sanitize_welcome(msg.text or "")
-        if not cleaned or cleaned.startswith("/") or cleaned.lower() in ("/start", "/setting"):
-            return await safe_reply(
-                update,
-                "Pesan terlihat masih mengandung command. Kirim ulang teks sambutan <b>tanpa</b> /start atau /setting.",
-                parse_mode=ParseMode.HTML
-            )
-        await set_welcome_text(pool, cleaned)
-        s.step = Step.IDLE
-        return await safe_reply(update, "✅ Pesan sambutan berhasil diperbarui.")
+    isadm = await is_admin(pool, uid)
 
-    if s.step == Step.ASK_TEXT:
-        if not msg.text or msg.text.strip().lower() == "/broadcast":
-            return await safe_reply(update, "Silakan kirim teks isi broadcast.")
-        text_html = getattr(msg, "text_html", None) or msg.text
-        s.draft.text = text_html
-        s.step = Step.ASK_MEDIA
-        return await safe_reply(update, "Kirimkan <b>foto/GIF/video</b> (opsional) atau ketik <b>skip</b>.", parse_mode=ParseMode.HTML)
+    # ADMIN FLOWS
+    if isadm:
+        # Ubah teks welcome
+        if s.step == Step.SET_WELCOME:
+            cleaned = sanitize_welcome(msg.text or "")
+            if not cleaned or cleaned.startswith("/") or cleaned.lower() in ("/start", "/setting"):
+                return await safe_reply(
+                    update,
+                    "Pesan terlihat masih mengandung command. Kirim ulang teks sambutan <b>tanpa</b> /start atau /setting.",
+                    parse_mode=ParseMode.HTML
+                )
+            await set_welcome_text(pool, cleaned)
+            s.step = Step.IDLE
+            start_on = await start_buttons_enabled(pool)
+            default_on = await default_buttons_enabled(pool)
+            return await safe_reply(update, "✅ Pesan sambutan berhasil diperbarui.",
+                                    reply_markup=_settings_menu_markup(start_on, default_on))
 
-    if s.step == Step.ASK_MEDIA:
-        if msg.text and msg.text.strip().lower() == "skip":
+        # Ubah teks default
+        if s.step == Step.SET_DEFAULT:
+            cleaned = sanitize_welcome(msg.text or "")
+            if not cleaned or cleaned.startswith("/") or cleaned.lower() in ("/start", "/setting"):
+                return await safe_reply(
+                    update,
+                    "Kirim ulang <b>teks default</b> (tanpa menyertakan /start atau /setting).",
+                    parse_mode=ParseMode.HTML
+                )
+            await set_default_text(pool, cleaned)
+            s.step = Step.IDLE
+            start_on = await start_buttons_enabled(pool)
+            default_on = await default_buttons_enabled(pool)
+            return await safe_reply(update, "✅ Pesan default berhasil diperbarui.",
+                                    reply_markup=_settings_menu_markup(start_on, default_on))
+
+        # Tambah tombol START
+        if s.step == Step.ADD_SB_TEXT:
+            if not msg.text:
+                return await safe_reply(update, "Kirim <b>teks tombol</b> /start.", parse_mode=ParseMode.HTML)
+            s.temp_sb_text = msg.text.strip()
+            s.step = Step.ADD_SB_URL
+            return await safe_reply(update, "Kirim <b>URL tombol</b> /start (harus http/https).", parse_mode=ParseMode.HTML)
+
+        if s.step == Step.ADD_SB_URL:
+            if not msg.text or not msg.text.strip().lower().startswith(("http://", "https://")):
+                return await safe_reply(update, "URL tidak valid. Contoh: https://example.com")
+            await add_start_button(pool, s.temp_sb_text, msg.text.strip())
+            s.temp_sb_text = None
+            s.step = Step.IDLE
+            rows = await list_start_buttons(pool)
+            return await safe_reply(update, "✅ Tombol /start ditambahkan.",
+                                    reply_markup=_start_buttons_admin(rows))
+
+        # Tambah tombol DEFAULT
+        if s.step == Step.ADD_DB_TEXT:
+            if not msg.text:
+                return await safe_reply(update, "Kirim <b>teks tombol</b> Default.", parse_mode=ParseMode.HTML)
+            s.temp_db_text = msg.text.strip()
+            s.step = Step.ADD_DB_URL
+            return await safe_reply(update, "Kirim <b>URL tombol</b> Default (harus http/https).", parse_mode=ParseMode.HTML)
+
+        if s.step == Step.ADD_DB_URL:
+            if not msg.text or not msg.text.strip().lower().startswith(("http://", "https://")):
+                return await safe_reply(update, "URL tidak valid. Contoh: https://example.com")
+            await add_default_button(pool, s.temp_db_text, msg.text.strip())
+            s.temp_db_text = None
+            s.step = Step.IDLE
+            rows = await list_default_buttons(pool)
+            return await safe_reply(update, "✅ Tombol Default ditambahkan.",
+                                    reply_markup=_default_buttons_admin(rows))
+
+        # Broadcast flow
+        if s.step == Step.ASK_TEXT:
+            if not msg.text or msg.text.strip().lower() == "/broadcast":
+                return await safe_reply(update, "Silakan kirim teks isi broadcast.")
+            text_html = getattr(msg, "text_html", None) or msg.text
+            s.draft.text = text_html
+            s.step = Step.ASK_MEDIA
+            return await safe_reply(update, "Kirimkan <b>foto/GIF/video</b> (opsional) atau ketik <b>skip</b>.", parse_mode=ParseMode.HTML)
+
+        if s.step == Step.ASK_MEDIA:
+            if msg.text and msg.text.strip().lower() == "skip":
+                s.step = Step.ASK_ADD_BUTTON
+                return await safe_reply(update, "Tambah <b>button</b>?", reply_markup=yesno_keyboard(), parse_mode=ParseMode.HTML)
+            if msg.photo:
+                s.draft.photo_file_id = msg.photo[-1].file_id
+                s.draft.video_file_id = None
+                s.draft.animation_file_id = None
+            elif msg.video:
+                s.draft.video_file_id = msg.video.file_id
+                s.draft.photo_file_id = None
+                s.draft.animation_file_id = None
+            elif msg.animation:
+                s.draft.animation_file_id = msg.animation.file_id
+                s.draft.photo_file_id = None
+                s.draft.video_file_id = None
+            else:
+                return await safe_reply(update, "Format tidak dikenali. Kirim foto/GIF/video atau <b>skip</b>.", parse_mode=ParseMode.HTML)
             s.step = Step.ASK_ADD_BUTTON
             return await safe_reply(update, "Tambah <b>button</b>?", reply_markup=yesno_keyboard(), parse_mode=ParseMode.HTML)
-        if msg.photo:
-            s.draft.photo_file_id = msg.photo[-1].file_id
-            s.draft.video_file_id = None
-            s.draft.animation_file_id = None
-        elif msg.video:
-            s.draft.video_file_id = msg.video.file_id
-            s.draft.photo_file_id = None
-            s.draft.animation_file_id = None
-        elif msg.animation:
-            s.draft.animation_file_id = msg.animation.file_id
-            s.draft.photo_file_id = None
-            s.draft.video_file_id = None
-        else:
-            return await safe_reply(update, "Format tidak dikenali. Kirim foto/GIF/video atau <b>skip</b>.", parse_mode=ParseMode.HTML)
-        s.step = Step.ASK_ADD_BUTTON
-        return await safe_reply(update, "Tambah <b>button</b>?", reply_markup=yesno_keyboard(), parse_mode=ParseMode.HTML)
 
-    if s.step == Step.ASK_ADD_BUTTON and msg.text:
-        txt = msg.text.strip().lower()
-        if txt in ("ya", "yes", "y"):
-            s.step = Step.ASK_BUTTON_TEXT
-            return await safe_reply(update, "Kirim <b>teks button</b> (contoh: Kunjungi Situs)", parse_mode=ParseMode.HTML)
-        if txt in ("tidak", "no", "n"):
-            s.step = Step.PREVIEW
-            return await send_preview_to_chat(context, update.effective_chat.id, s.draft)
+        if s.step == Step.ASK_ADD_BUTTON and msg.text:
+            txt = msg.text.strip().lower()
+            if txt in ("ya", "yes", "y"):
+                s.step = Step.ASK_BUTTON_TEXT
+                return await safe_reply(update, "Kirim <b>teks button</b> (contoh: Kunjungi Situs)", parse_mode=ParseMode.HTML)
+            if txt in ("tidak", "no", "n"):
+                s.step = Step.PREVIEW
+                return await send_preview_to_chat(context, update.effective_chat.id, s.draft)
 
-    if s.step == Step.ASK_BUTTON_TEXT:
-        if not msg.text:
-            return await safe_reply(update, "Kirim teks button (misal: Kunjungi Situs).")
-        s.temp_button_text = msg.text.strip()
-        s.step = Step.ASK_BUTTON_URL
-        return await safe_reply(update, "Kirim URL button (harus diawali http/https).")
+        if s.step == Step.ASK_BUTTON_TEXT:
+            if not msg.text:
+                return await safe_reply(update, "Kirim teks button (misal: Kunjungi Situs).")
+            s.temp_button_text = msg.text.strip()
+            s.step = Step.ASK_BUTTON_URL
+            return await safe_reply(update, "Kirim URL button (harus diawali http/https).")
 
-    if s.step == Step.ASK_BUTTON_URL:
-        if not msg.text or not msg.text.strip().lower().startswith(("http://", "https://")):
-            return await safe_reply(update, "URL tidak valid. Contoh: https://example.com")
-        s.draft.buttons.append(ButtonDef(text=s.temp_button_text, url=msg.text.strip()))
-        s.temp_button_text = None
-        s.step = Step.ASK_ADD_BUTTON
-        return await safe_reply(update, "Tambah button lagi?", reply_markup=yesno_keyboard())
+        if s.step == Step.ASK_BUTTON_URL:
+            if not msg.text or not msg.text.strip().lower().startswith(("http://", "https://")):
+                return await safe_reply(update, "URL tidak valid. Contoh: https://example.com")
+            s.draft.buttons.append(ButtonDef(text=s.temp_button_text, url=msg.text.strip()))
+            s.temp_button_text = None
+            s.step = Step.ASK_ADD_BUTTON
+            return await safe_reply(update, "Tambah button lagi?", reply_markup=yesno_keyboard())
 
-    if s.step == Step.ADD_LINK_TITLE:
-        if not msg.text:
-            return await safe_reply(update, "Kirim judul link (teks).")
-        s.temp_link_title = msg.text.strip()
-        s.step = Step.ADD_LINK_URL
-        return await safe_reply(update, "Kirim URL link (harus diawali http/https).")
+        if s.step == Step.ADD_LINK_TITLE:
+            if not msg.text:
+                return await safe_reply(update, "Kirim judul link (teks).")
+            s.temp_link_title = msg.text.strip()
+            s.step = Step.ADD_LINK_URL
+            return await safe_reply(update, "Kirim URL link (harus diawali http/https).")
 
-    if s.step == Step.ADD_LINK_URL:
-        if not msg.text or not msg.text.strip().lower().startswith(("http://", "https://")):
-            return await safe_reply(update, "URL tidak valid. Contoh: https://example.com")
-        await add_link(pool, s.temp_link_title, msg.text.strip())
-        s.temp_link_title = None
-        s.step = Step.IDLE
-        return await safe_reply(update, "✅ Link promo ditambahkan. Ketik /link untuk melihat daftar.")
+        if s.step == Step.ADD_LINK_URL:
+            if not msg.text or not msg.text.strip().lower().startswith(("http://", "https://")):
+                return await safe_reply(update, "URL tidak valid. Contoh: https://example.com")
+            await add_link(pool, s.temp_link_title, msg.text.strip())
+            s.temp_link_title = None
+            s.step = Step.IDLE
+            return await safe_reply(update, "✅ Link promo ditambahkan. Ketik /link untuk melihat daftar.")
+
+    # PUBLIC: jika bukan command → balas default
+    if msg and msg.text and msg.text.strip().startswith("/"):
+        return
+    await send_default_reply(update, context)
 
 # ---------------- Callback ----------------
 async def cb_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -697,31 +947,134 @@ async def cb_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
     isadm = await is_admin(pool, uid)
 
-    if data == "link_add":
+    # Settings panel actions
+    if data == "set_welcome":
         if not isadm:
             return await query.answer("Khusus admin.", show_alert=True)
-        s.step = Step.ADD_LINK_TITLE
-        return await query.edit_message_text("Kirim <b>judul link</b>:", parse_mode=ParseMode.HTML)
+        s.step = Step.SET_WELCOME
+        return await query.edit_message_text("Kirim <b>teks sambutan baru</b> untuk /start (Markdown didukung).",
+                                             parse_mode=ParseMode.HTML)
 
-    if data.startswith("link_del:"):
+    if data == "set_default":
+        if not isadm:
+            return await query.answer("Khusus admin.", show_alert=True)
+        s.step = Step.SET_DEFAULT
+        return await query.edit_message_text("Kirim <b>teks default</b> (Markdown didukung).",
+                                             parse_mode=ParseMode.HTML)
+
+    if data == "toggle_start_btn":
+        if not isadm:
+            return await query.answer("Khusus admin.", show_alert=True)
+        new_state = await _toggle_bool(pool, "start_buttons_on")
+        start_on = new_state
+        default_on = await default_buttons_enabled(pool)
+        return await query.edit_message_text(
+            "<b>Panel Pengaturan</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_settings_menu_markup(start_on, default_on)
+        )
+
+    if data == "toggle_default_btn":
+        if not isadm:
+            return await query.answer("Khusus admin.", show_alert=True)
+        new_state = await _toggle_bool(pool, "default_buttons_on")
+        start_on = await start_buttons_enabled(pool)
+        default_on = new_state
+        return await query.edit_message_text(
+            "<b>Panel Pengaturan</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=_settings_menu_markup(start_on, default_on)
+        )
+
+    if data == "open_link_admin":
+        if not isadm:
+            return await query.answer("Khusus admin.", show_alert=True)
+        rows = await list_links(pool)
+        return await query.edit_message_text(
+            "🔗 <b>Link Promo</b>\nAdmin dapat menambah/hapus link dari tombol di bawah.\n(Catatan: tidak mempengaruhi tombol /start & Default)",
+            reply_markup=_link_keyboard_admin(rows),
+            parse_mode=ParseMode.HTML
+        )
+
+    # START buttons admin
+    if data == "open_start_btn_admin":
+        if not isadm:
+            return await query.answer("Khusus admin.", show_alert=True)
+        rows = await list_start_buttons(pool)
+        return await query.edit_message_text(
+            "⚙️ <b>Kelola Tombol /start</b>",
+            reply_markup=_start_buttons_admin(rows),
+            parse_mode=ParseMode.HTML
+        )
+
+    if data == "sb_add":
+        if not isadm:
+            return await query.answer("Khusus admin.", show_alert=True)
+        s.step = Step.ADD_SB_TEXT
+        return await query.edit_message_text("Kirim <b>teks tombol</b> /start:", parse_mode=ParseMode.HTML)
+
+    if data.startswith("sb_del:"):
         if not isadm:
             return await query.answer("Khusus admin.", show_alert=True)
         try:
-            link_id = int(data.split(":",1)[1])
+            bid = int(data.split(":",1)[1])
         except:
             return await query.answer("ID tidak valid.", show_alert=True)
-        ok = await delete_link(pool, link_id)
+        ok = await delete_start_button(pool, bid)
+        rows = await list_start_buttons(pool)
         if ok:
-            rows = await list_links(pool)
-            await query.edit_message_text(
-                "🔗 <b>Link Promo</b>\nAdmin dapat menambah/hapus link dari tombol di bawah.",
-                reply_markup=_link_keyboard_admin(rows),
+            return await query.edit_message_text(
+                "⚙️ <b>Kelola Tombol /start</b>\n✅ Dihapus.",
+                reply_markup=_start_buttons_admin(rows),
                 parse_mode=ParseMode.HTML
             )
         else:
-            await query.answer("Gagal menghapus (mungkin sudah dihapus).", show_alert=True)
-        return
+            return await query.edit_message_text(
+                "⚙️ <b>Kelola Tombol /start</b>\n❌ Gagal menghapus.",
+                reply_markup=_start_buttons_admin(rows),
+                parse_mode=ParseMode.HTML
+            )
 
+    # DEFAULT buttons admin
+    if data == "open_default_btn_admin":
+        if not isadm:
+            return await query.answer("Khusus admin.", show_alert=True)
+        rows = await list_default_buttons(pool)
+        return await query.edit_message_text(
+            "⚙️ <b>Kelola Tombol Pesan Default</b>",
+            reply_markup=_default_buttons_admin(rows),
+            parse_mode=ParseMode.HTML
+        )
+
+    if data == "db_add":
+        if not isadm:
+            return await query.answer("Khusus admin.", show_alert=True)
+        s.step = Step.ADD_DB_TEXT
+        return await query.edit_message_text("Kirim <b>teks tombol</b> Default:", parse_mode=ParseMode.HTML)
+
+    if data.startswith("db_del:"):
+        if not isadm:
+            return await query.answer("Khusus admin.", show_alert=True)
+        try:
+            bid = int(data.split(":",1)[1])
+        except:
+            return await query.answer("ID tidak valid.", show_alert=True)
+        ok = await delete_default_button(pool, bid)
+        rows = await list_default_buttons(pool)
+        if ok:
+            return await query.edit_message_text(
+                "⚙️ <b>Kelola Tombol Pesan Default</b>\n✅ Dihapus.",
+                reply_markup=_default_buttons_admin(rows),
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            return await query.edit_message_text(
+                "⚙️ <b>Kelola Tombol Pesan Default</b>\n❌ Gagal menghapus.",
+                reply_markup=_default_buttons_admin(rows),
+                parse_mode=ParseMode.HTML
+            )
+
+    # Broadcast preview actions
     if s.step == Step.PREVIEW:
         if data == "preview_send":
             await query.edit_message_text("Mulai broadcast…")
@@ -832,7 +1185,7 @@ def build_app():
     app.add_handler(CommandHandler("stats", stats_cmd), group=0)
     app.add_handler(CommandHandler("admins", admins_cmd), group=0)
 
-    # Owner & admin mgmt (dengan alias)
+    # Owner & admin mgmt
     app.add_handler(CommandHandler(["admin_add","addadmin","add_admin"], admin_add_cmd), group=0)
     app.add_handler(CommandHandler(["admin_del","deladmin","del_admin","admin_delete"], admin_del_cmd), group=0)
     app.add_handler(CommandHandler(["owner_show","owner"], owner_show_cmd), group=0)
