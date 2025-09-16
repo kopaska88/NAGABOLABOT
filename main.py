@@ -36,7 +36,7 @@ def sanitize_welcome(text: str) -> str:
 
 # ---------------- Logging ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s | %(message)s")
-log = logging.getLogger("NAGABOLA-bot")
+log = logging.getLogger("nagabola-bot")
 
 # ---------------- Env ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
@@ -78,7 +78,7 @@ async def init_db(pool):
             """INSERT INTO settings(key, value) VALUES($1, $2)
                ON CONFLICT (key) DO NOTHING""",
             "welcome_text",
-            "🎉 Selamat datang di *NAGABOLA*! 🎉\n\n"
+            "🎉 Selamat datang di *nagabola*! 🎉\n\n"
             "Temukan info & promo eksklusif di sini. Ketik /link untuk lihat tautan promo terbaru."
         )
         await con.execute(
@@ -120,7 +120,7 @@ async def init_db(pool):
             await con.executemany(
                 "INSERT INTO promo_links(title,url,position) VALUES($1,$2,$3)",
                 [
-                    ("Daftar NAGABOLA", "https://example.com/daftar", 1),
+                    ("Daftar nagabola", "https://example.com/daftar", 1),
                     ("Claim Bonus", "https://example.com/bonus", 2),
                     ("Live Chat", "https://example.com/livechat", 3),
                 ],
@@ -260,7 +260,7 @@ async def _toggle_bool(pool, key:str) -> bool:
 
 async def get_welcome_text(pool) -> str:
     return await _get_setting(pool, "welcome_text",
-        "Selamat datang di *NAGABOLA*!")
+        "Selamat datang di *nagabola*!")
 
 async def set_welcome_text(pool, text:str):
     await _set_setting(pool, "welcome_text", text)
@@ -291,8 +291,13 @@ async def add_link(pool, title:str, url:str):
 
 async def delete_link(pool, link_id:int) -> bool:
     async with pool.acquire() as con:
-        res = await con.execute("DELETE FROM promo_links WHERE id=$1", link_id)
-        return res.endswith("1")
+        try:
+            result = await con.execute("DELETE FROM promo_links WHERE id=$1", link_id)
+            # Periksa apakah baris terhapus
+            return "DELETE 1" in result
+        except Exception as e:
+            log.warning("delete_link error: %s", e)
+            return False
 
 # ---- START buttons CRUD
 async def list_start_buttons(pool):
@@ -656,7 +661,7 @@ async def help_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
         return await safe_reply(update, pub, parse_mode=ParseMode.HTML)
 
     text = (
-        "<b>🛠 Bantuan Admin NAGABOLA</b>\n\n"
+        "<b>🛠 Bantuan Admin nagabola</b>\n\n"
         "/stats - Jumlah pengguna \n"
         "/admins - Daftar admin\n"
         "/admin_add - Tambah admin\n"
@@ -858,6 +863,28 @@ async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
             return await safe_reply(update, "✅ Tombol Default ditambahkan.",
                                     reply_markup=_default_buttons_admin(rows))
 
+        # Tambah link promo
+        if s.step == Step.ADD_LINK_TITLE:
+            if not msg.text:
+                return await safe_reply(update, "Kirim judul link (teks).")
+            s.temp_link_title = msg.text.strip()
+            s.step = Step.ADD_LINK_URL
+            return await safe_reply(update, "Kirim URL link (harus diawali http/https).")
+
+        if s.step == Step.ADD_LINK_URL:
+            if not msg.text or not msg.text.strip().lower().startswith(("http://", "https://")):
+                return await safe_reply(update, "URL tidak valid. Contoh: https://example.com")
+            await add_link(pool, s.temp_link_title, msg.text.strip())
+            s.temp_link_title = None
+            s.step = Step.IDLE
+            rows = await list_links(pool)
+            return await safe_reply(
+                update, 
+                "✅ Link promo ditambahkan.", 
+                reply_markup=_link_keyboard_admin(rows),
+                parse_mode=ParseMode.HTML
+            )
+
         # Broadcast flow
         if s.step == Step.ASK_TEXT:
             if not msg.text or msg.text.strip().lower() == "/broadcast":
@@ -911,21 +938,6 @@ async def handle_message(update:Update, context:ContextTypes.DEFAULT_TYPE):
             s.temp_button_text = None
             s.step = Step.ASK_ADD_BUTTON
             return await safe_reply(update, "Tambah button lagi?", reply_markup=yesno_keyboard())
-
-        if s.step == Step.ADD_LINK_TITLE:
-            if not msg.text:
-                return await safe_reply(update, "Kirim judul link (teks).")
-            s.temp_link_title = msg.text.strip()
-            s.step = Step.ADD_LINK_URL
-            return await safe_reply(update, "Kirim URL link (harus diawali http/https).")
-
-        if s.step == Step.ADD_LINK_URL:
-            if not msg.text or not msg.text.strip().lower().startswith(("http://", "https://")):
-                return await safe_reply(update, "URL tidak valid. Contoh: https://example.com")
-            await add_link(pool, s.temp_link_title, msg.text.strip())
-            s.temp_link_title = None
-            s.step = Step.IDLE
-            return await safe_reply(update, "✅ Link promo ditambahkan. Ketik /link untuk melihat daftar.")
 
     # PUBLIC: jika bukan command → balas default
     if msg and msg.text and msg.text.strip().startswith("/"):
@@ -995,6 +1007,35 @@ async def cb_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
             reply_markup=_link_keyboard_admin(rows),
             parse_mode=ParseMode.HTML
         )
+
+    # Link promo actions
+    if data == "link_add":
+        if not isadm:
+            return await query.answer("Khusus admin.", show_alert=True)
+        s.step = Step.ADD_LINK_TITLE
+        return await query.edit_message_text("Kirim <b>judul link</b> promo:", parse_mode=ParseMode.HTML)
+
+    if data.startswith("link_del:"):
+        if not isadm:
+            return await query.answer("Khusus admin.", show_alert=True)
+        try:
+            link_id = int(data.split(":",1)[1])
+        except:
+            return await query.answer("ID tidak valid.", show_alert=True)
+        ok = await delete_link(pool, link_id)
+        rows = await list_links(pool)
+        if ok:
+            return await query.edit_message_text(
+                "🔗 <b>Link Promo</b>\n✅ Link dihapus.",
+                reply_markup=_link_keyboard_admin(rows),
+                parse_mode=ParseMode.HTML
+            )
+        else:
+            return await query.edit_message_text(
+                "🔗 <b>Link Promo</b>\n❌ Gagal menghapus link.",
+                reply_markup=_link_keyboard_admin(rows),
+                parse_mode=ParseMode.HTML
+            )
 
     # START buttons admin
     if data == "open_start_btn_admin":
