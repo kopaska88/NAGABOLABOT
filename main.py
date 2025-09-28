@@ -235,6 +235,14 @@ async def get_all_user_ids(pool) -> List[int]:
         rows = await con.fetch("SELECT user_id FROM users")
         return [r[0] for r in rows]
 
+async def _delete_user(pool, uid:int) -> None:
+    try:
+        async with pool.acquire() as con:
+            await con.execute("DELETE FROM users WHERE user_id=$1", uid)
+    except Exception as e:
+        log.warning("delete user %s failed: %s", uid, e)
+
+
 # ---- Settings helpers (texts & toggles)
 async def _get_setting(pool, key:str, default:str="") -> str:
     async with pool.acquire() as con:
@@ -1144,9 +1152,15 @@ async def do_broadcast(context:ContextTypes.DEFAULT_TYPE, draft:BroadcastDraft, 
     pool = get_pool(context)
     if not pool:
         return await query.message.reply_text("⚠️ DB tidak siap; broadcast dibatalkan.")
+
     targets = await get_all_user_ids(pool)
+    total_targets = len(targets)
+
     sent = 0
     failed = 0
+    blocked_count = 0
+    deleted_count = 0
+
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(b.text, url=b.url)] for b in draft.buttons]) if draft.buttons else InlineKeyboardMarkup([])
 
     for chat_id in targets:
@@ -1159,14 +1173,45 @@ async def do_broadcast(context:ContextTypes.DEFAULT_TYPE, draft:BroadcastDraft, 
                 await context.bot.send_animation(chat_id, draft.animation_file_id, caption=draft.text, parse_mode=ParseMode.HTML, reply_markup=kb)
             else:
                 await context.bot.send_message(chat_id, draft.text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
             sent += 1
             await asyncio.sleep(0.05)
+
         except Exception as e:
-            failed += 1
-            log.warning("Broadcast fail %s: %s", chat_id, e)
+            msg = str(e).lower()
+            # Klasifikasi error yang umum dari Telegram API
+            # Contoh pesan:
+            # - "Forbidden: bot was blocked by the user"
+            # - "Forbidden: user is deactivated"
+            # - "Bad Request: chat not found"
+            # - "Bad Request: PEER_ID_INVALID"
+            if "blocked by the user" in msg:
+                blocked_count += 1
+                log.info("User %s blocked the bot.", chat_id)
+            elif ("user is deactivated" in msg) or ("chat not found" in msg) or ("peer_id_invalid" in msg):
+                deleted_count += 1
+                log.info("User %s deactivated/invalid. Removing from DB.", chat_id)
+                await _delete_user(pool, chat_id)
+            else:
+                failed += 1
+                log.warning("Broadcast fail %s: %s", chat_id, e)
             await asyncio.sleep(0.3)
 
-    await query.message.reply_text(f"Selesai. Terkirim: {sent}, Gagal: {failed}")
+    # Hitung total pengguna setelah pembersihan akun terhapus
+    total_users_after = await count_users(pool)
+
+    summary = (
+        "📣 <b>Rekap Broadcast</b>\n"
+        f"• Total target: <b>{total_targets}</b>\n"
+        f"• Berhasil terkirim: <b>{sent}</b>\n"
+        f"• Pengguna memblokir bot: <b>{blocked_count}</b>\n"
+        f"• Akun terhapus/invalid: <b>{deleted_count}</b>\n"
+        f"• Gagal (lainnya): <b>{failed}</b>\n"
+        f"• Total pengguna saat ini: <b>{total_users_after}</b>"
+    )
+
+    await query.message.reply_text(summary, parse_mode=ParseMode.HTML)
+
 
 # ---------------- Health & Error ----------------
 async def health_cmd(update:Update, context:ContextTypes.DEFAULT_TYPE):
